@@ -1,0 +1,6 @@
+[submodule "bridge"]
+	path = bridge
+	url = https://github.com/liwei1997/codex-watch-bridge.git
+[submodule "watch"]
+	path = watch
+	url = https://github.com/liwei1997/codex-watch-watch.git
