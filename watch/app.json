@@ -1,0 +1,60 @@
+{
+  "configVersion": "v3",
+  "app": {
+    "appId": 28869,
+    "appName": "Codex Watch",
+    "appType": "app",
+    "version": {
+      "code": 12,
+      "name": "1.1.8"
+    },
+    "icon": "icon.png",
+    "vender": "zepp",
+    "description": "Remote Codex CLI companion"
+  },
+  "permissions": [
+    "device:os.bg_service",
+    "device:os.notification"
+  ],
+  "runtime": {
+    "apiVersion": {
+      "compatible": "4.0",
+      "target": "4.0",
+      "minVersion": "4.0"
+    }
+  },
+  "targets": {
+    "default": {
+      "module": {
+        "page": {
+          "pages": [
+            "page/index",
+            "page/inbox",
+            "page/approvals"
+          ]
+        },
+        "app-side": {
+          "path": "app-side/index"
+        },
+        "app-service": {
+          "services": [
+            "app-service/codex_background",
+            "app-service/approval_action"
+          ]
+        }
+      },
+      "platforms": [
+        {
+          "st": "r",
+          "dw": 480
+        }
+      ]
+    }
+  },
+  "i18n": {
+    "en-US": {
+      "appName": "Codex Watch"
+    }
+  },
+  "defaultLanguage": "en-US"
+}

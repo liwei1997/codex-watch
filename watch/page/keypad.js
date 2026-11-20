@@ -1,0 +1,92 @@
+import {
+  onKey,
+  KEY_UP,
+  KEY_DOWN,
+  KEY_SELECT,
+  KEY_EVENT_CLICK,
+  KEY_EVENT_LONG_PRESS
+} from '@zos/interaction'
+
+// ============================================================
+// Shared physical-key handler (singleton).
+//
+// Only ONE onKey registration is allowed for the whole app,
+// so every page funnels through this module. The page that is
+// visible activates its handler; when a page is destroyed the
+// handler is deactivated.
+//
+// Both short clicks (KEY_EVENT_CLICK) and long presses
+// (KEY_EVENT_LONG_PRESS) produce actions. A long press is
+// followed by a click on key release; that trailing click is
+// suppressed so one physical press yields exactly one action.
+// ============================================================
+
+let activeHandler = null
+let registered = false
+let suppressClickUntil = 0
+const CLICK_SUPPRESS_MS = 600
+
+function mapKey(key) {
+  switch (key) {
+    case KEY_UP:
+      return 'up'
+
+    case KEY_DOWN:
+      return 'down'
+
+    case KEY_SELECT:
+      return 'select'
+
+    default:
+      return null
+  }
+}
+
+function registerKeyListener() {
+  if (registered) {
+    return
+  }
+
+  onKey({
+    callback: (key, event) => {
+      if (!activeHandler) {
+        return false
+      }
+
+      const action = mapKey(key)
+
+      if (!action) {
+        return false
+      }
+
+      if (event === KEY_EVENT_LONG_PRESS) {
+        // The trailing click on release must not re-fire.
+        suppressClickUntil = Date.now() + CLICK_SUPPRESS_MS
+        console.log('[Keypad] LONG:', action)
+        return activeHandler(action) !== false
+      }
+
+      if (event === KEY_EVENT_CLICK) {
+        if (Date.now() < suppressClickUntil) {
+          return true
+        }
+
+        console.log('[Keypad] CLICK:', action)
+        return activeHandler(action) !== false
+      }
+
+      return false
+    }
+  })
+
+  registered = true
+}
+
+export function activateKeypad(handler) {
+  registerKeyListener()
+  activeHandler = handler
+}
+
+export function deactivateKeypad() {
+  activeHandler = null
+}
