@@ -1,11 +1,11 @@
 {
-  "name": "empty",
+  "name": "codex-watch",
   "version": "1.1.8",
   "description": "",
   "main": "app.js",
   "type": "module",
   "scripts": {
-    "test": "node --test --test-isolation=none tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs"
   },
   "author": "",
   "license": "ISC",
