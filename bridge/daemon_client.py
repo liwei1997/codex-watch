@@ -418,12 +418,13 @@ class DaemonClient:
         )
 
         # Delay push: only notify watch if still pending after 60s
-        threading.Timer(
+        _timer = threading.Timer(
             APPROVAL_PUSH_DELAY,
             self._delayed_push,
             args=(approval_id, thread_id, turn_id, kind, command, cwd, reason, available, method),
-            daemon=True,
-        ).start()
+        )
+        _timer.daemon = True
+        _timer.start()
     def _delayed_push(self, approval_id, thread_id, turn_id, kind, command, cwd, reason, available, method):
         """Push approval to watch only if still pending (user hasn't responded in terminal)."""
         if not self.event_sink:

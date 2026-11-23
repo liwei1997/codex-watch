@@ -325,16 +325,26 @@ def store_notify_approval(data):
         approval_id, thread_id, kind, (command or "")[:120], fresh,
     )
 
+    # Join the thread so the daemon replays the still-pending approval
+    # server-request to us. Without this, no daemon sibling row is ever
+    # created and watch decisions fail with 409.
+    try:
+        if daemon_client.INSTANCE is not None and thread_id:
+            daemon_client.INSTANCE.note_thread(thread_id, cwd=cwd)
+    except Exception as exc:
+        log.warning("note_thread in store_notify_approval failed: %r", exc)
+
     # Delay the push: only notify the watch if the approval is still pending
     # after NOTIFY_PUSH_DELAY seconds (i.e. the user has not answered in the
     # Codex terminal). Mirrors the daemon path's grace period.
     if fresh:
-        threading.Timer(
+        _timer = threading.Timer(
             NOTIFY_PUSH_DELAY,
             _push_notify_approval,
             args=(approval_id, thread_id, turn_id, kind, command, cwd, reason, available),
-            daemon=True,
-        ).start()
+        )
+        _timer.daemon = True
+        _timer.start()
 
     return {"ok": True, "approval_id": approval_id, "event_id": "appr-" + approval_id}
 
