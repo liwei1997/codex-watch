@@ -335,14 +335,14 @@ Page(
         12, COLORS.muted, 0
       )
       const status = addText(
-        'SELECT A DECISION', 70, 254, 340, 22,
+        (approval.actionable === false ? 'APPROVE IN CODEX TERMINAL' : 'SELECT A DECISION'), 70, 254, 340, 22,
         14, COLORS.muted, 0
       )
 
       const approveItem = {
         button: addButton(
           'APPROVE', 70, 288, 105, 52,
-          () => self.decisionAction('accept'),
+          () => approval.actionable !== false && self.decisionAction('accept'),
           {
             normalColor: COLORS.green,
             pressColor: COLORS.greenPress,
@@ -356,7 +356,7 @@ Page(
       const rejectItem = {
         button: addButton(
           'REJECT', 188, 288, 105, 52,
-          () => self.decisionAction('decline'),
+          () => approval.actionable !== false && self.decisionAction('decline'),
           {
             normalColor: COLORS.red,
             pressColor: COLORS.redPress,
@@ -381,13 +381,15 @@ Page(
         pressColor: 0x3d5263
       }
 
-      const buttons = [approveItem, rejectItem, cancelItem]
+      const buttons = approval.actionable === false
+        ? [cancelItem]
+        : [approveItem, rejectItem, cancelItem]
 
       const overlay = {
         approval,
         widgets: [card, title, command, project, status],
         buttons,
-        selected: 2, // safe default
+        selected: approval.actionable === false ? 0 : 2, // safe default
         busy: false,
         closeTimer: null
       }
@@ -509,6 +511,10 @@ Page(
       const overlay = this.overlay
 
       if (!overlay || overlay.busy) {
+        return
+      }
+      if (overlay.approval.actionable === false) {
+        overlay.setStatus('APPROVE IN CODEX TERMINAL', COLORS.orangeText)
         return
       }
 
