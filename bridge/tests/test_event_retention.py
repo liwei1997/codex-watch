@@ -141,6 +141,28 @@ class EventRetentionTest(unittest.TestCase):
 
         self.assertEqual(self.get_events(), [])
 
+    def test_pending_approval_precedes_older_completion(self):
+        server.store_event({
+            "event_id": "older-completion",
+            "source": "codex",
+            "machine_id": "workstation",
+            "session_id": "thread-queue",
+            "type": "task_completed",
+            "title": "Done",
+            "body": "older message",
+            "payload": {},
+        })
+        result = server.store_notify_approval({
+            "thread_id": "thread-priority",
+            "turn_id": "turn-priority",
+            "kind": "command",
+            "command": "git push",
+            "cwd": "/tmp/project",
+        })
+        ids = [event["event_id"] for event in self.get_events()]
+        self.assertEqual(ids[0], result["event_id"])
+        self.assertIn("older-completion", ids)
+
     def test_pending_approval_remains_deliverable(self):
         now = 1_800_000_000
 
