@@ -563,7 +563,9 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     )
 
-                ORDER BY e.created_at ASC
+                ORDER BY
+                    CASE WHEN e.event_type = 'approval_request' THEN 0 ELSE 1 END,
+                    e.created_at ASC
 
                 LIMIT ?
             """, (
