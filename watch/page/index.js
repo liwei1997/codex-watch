@@ -81,15 +81,15 @@ const CARDS = [
 // Background App Service
 // ============================================================
 
-let backgroundStartRequested = false
+let backgroundStartInFlight = false
 
 function launchBackgroundService() {
-  if (backgroundStartRequested) {
-    console.log(TAG + ' Background start already requested')
+  if (backgroundStartInFlight) {
+    console.log(TAG + ' Background start already in flight')
     return
   }
 
-  backgroundStartRequested = true
+  backgroundStartInFlight = true
 
   try {
     const result = start({
@@ -102,8 +102,9 @@ function launchBackgroundService() {
           JSON.stringify(status)
         )
 
+        backgroundStartInFlight = false
+
         if (!status || status.result !== true) {
-          backgroundStartRequested = false
           console.log(TAG + ' Background start failed')
         } else {
           console.log(TAG + ' Background service running')
@@ -114,10 +115,10 @@ function launchBackgroundService() {
     console.log(TAG + ' Background start return: ' + result)
 
     if (result !== 0) {
-      backgroundStartRequested = false
+      backgroundStartInFlight = false
     }
   } catch (error) {
-    backgroundStartRequested = false
+    backgroundStartInFlight = false
     console.log(TAG + ' Background exception: ' + String(error))
   }
 }
