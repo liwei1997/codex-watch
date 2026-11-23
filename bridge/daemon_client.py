@@ -57,6 +57,7 @@ APPROVAL_METHODS = {
 VALID_DECISIONS = ("accept", "decline", "cancel")
 
 EVENT_TTL = 3600  # approval notifications expire after 1 hour
+APPROVAL_PUSH_DELAY = 60  # seconds to wait before pushing approval to watch
 REJOIN_LIMIT = 20  # max persisted threads to rejoin on reconnect
 
 
@@ -384,6 +385,7 @@ class DaemonClient:
                     status, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                 ON CONFLICT(thread_id, request_id) DO UPDATE SET
+                    approval_id = excluded.approval_id,
                     status = 'pending',
                     decision = NULL,
                     decided_at = NULL,
@@ -415,35 +417,58 @@ class DaemonClient:
             approval_id, thread_id, kind, (command or "")[:120],
         )
 
-        if self.event_sink:
-            project = os.path.basename(cwd) if cwd else "codex"
-            body = (command or reason or method).strip().replace("\n", " ")
-            if len(body) > 160:
-                body = body[:157] + "..."
-            try:
-                self.event_sink({
-                    "event_id": "appr-" + approval_id,
-                    "source": "daemon-client",
-                    "machine_id": MACHINE_ID,
-                    "session_id": thread_id,
-                    "type": "approval_request",
-                    "title": "APPROVAL NEEDED",
-                    "body": f"{project}: {body}",
-                    "payload": {
-                        "approval_id": approval_id,
-                        "thread_id": thread_id,
-                        "turn_id": turn_id,
-                        "kind": kind,
-                        "command": command,
-                        "cwd": cwd,
-                        "reason": reason,
-                        "available_decisions": available,
-                    },
-                    "created_at": now,
-                    "expires_at": now + EVENT_TTL,
-                })
-            except Exception as e:
-                log.warning("approval event push failed: %r", e)
+        # Delay push: only notify watch if still pending after 60s
+        threading.Timer(
+            APPROVAL_PUSH_DELAY,
+            self._delayed_push,
+            args=(approval_id, thread_id, turn_id, kind, command, cwd, reason, available, method),
+            daemon=True,
+        ).start()
+    def _delayed_push(self, approval_id, thread_id, turn_id, kind, command, cwd, reason, available, method):
+        """Push approval to watch only if still pending (user hasn't responded in terminal)."""
+        if not self.event_sink:
+            return
+        conn = _connect_db(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM approvals WHERE approval_id=?", (approval_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or row["status"] != "pending":
+            log.info("approval %s no longer pending (status=%s), skip push",
+                     approval_id, row["status"] if row else "missing")
+            return
+        project = os.path.basename(cwd) if cwd else "codex"
+        body = (command or reason or method).strip().replace("\n", " ")
+        if len(body) > 160:
+            body = body[:157] + "..."
+        now = int(time.time())
+        try:
+            self.event_sink({
+                "event_id": "appr-" + approval_id,
+                "source": "daemon-client",
+                "machine_id": MACHINE_ID,
+                "session_id": thread_id,
+                "type": "approval_request",
+                "title": "APPROVAL NEEDED",
+                "body": f"{project}: {body}",
+                "payload": {
+                    "approval_id": approval_id,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "kind": kind,
+                    "command": command,
+                    "cwd": cwd,
+                    "reason": reason,
+                    "available_decisions": available,
+                },
+                "created_at": now,
+                "expires_at": now + EVENT_TTL,
+            })
+            log.info("approval %s pushed to watch (still pending after %ds)", approval_id, APPROVAL_PUSH_DELAY)
+        except Exception as e:
+            log.warning("approval delayed push failed: %r", e)
 
     def _mark_resolved(self, thread_id, request_id):
         """serverRequest/resolved: someone (terminal or watch) answered."""
@@ -510,18 +535,68 @@ class DaemonClient:
             return {"ok": False, "error": "approval not found"}
         if row["status"] not in ("pending", "sent"):
             return {"ok": False, "error": "approval already %s" % row["status"]}
-        if str(row["request_id"]).startswith("notify:"):
-            return {"ok": False, "error": "notification-only approval has no daemon request id; approve in Codex terminal"}
+
+        # If this is a notify-hook row (no daemon request id of its own), find the
+        # matching daemon row and answer through it so the tap actually works.
+        notify_row = str(row["request_id"]).startswith("notify:")
+        respond_row = row
+        sibling_id = None
+        if notify_row:
+            conn = _connect_db(self.db_path)
+            try:
+                if row["turn_id"]:
+                    sib = conn.execute(
+                        """
+                        SELECT * FROM approvals
+                        WHERE thread_id=? AND turn_id=?
+                          AND request_id NOT LIKE 'notify:%'
+                          AND status IN ('pending','sent')
+                          AND command = ?
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (row["thread_id"], row["turn_id"], row["command"]),
+                    ).fetchone()
+                    if sib is None:
+                        sib = conn.execute(
+                            """
+                            SELECT * FROM approvals
+                            WHERE thread_id=? AND turn_id=?
+                              AND request_id NOT LIKE 'notify:%'
+                              AND status IN ('pending','sent')
+                            ORDER BY created_at DESC LIMIT 1
+                            """,
+                            (row["thread_id"], row["turn_id"]),
+                        ).fetchone()
+                else:
+                    sib = conn.execute(
+                        """
+                        SELECT * FROM approvals
+                        WHERE thread_id=?
+                          AND request_id NOT LIKE 'notify:%'
+                          AND status IN ('pending','sent')
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (row["thread_id"],),
+                    ).fetchone()
+            finally:
+                conn.close()
+            if sib is None:
+                return {
+                    "ok": False,
+                    "error": "no active daemon approval to answer; approve in Codex terminal",
+                }
+            respond_row = sib
+            sibling_id = row["approval_id"]
 
         try:
             # Daemon server-request id is a JSON integer, but request_id is stored
             # in a TEXT column (SQLite TEXT affinity coerces it to a string). Echo it
             # back as an int or the daemon cannot match the response and drops it.
-            rid = row["request_id"]
+            rid = respond_row["request_id"]
             try:
                 rid = int(rid)
             except (TypeError, ValueError):
-                pass
+                return {"ok": False, "error": "approval has no valid daemon request id; approve in Codex terminal"}
             client.respond(rid, {"decision": decision})
         except Exception as e:
             log.warning("respond failed for %s: %r", approval_id, e)
@@ -536,12 +611,21 @@ class DaemonClient:
                 SET status='sent', decision=?, decided_at=?, decided_by='watch'
                 WHERE approval_id=?
                 """,
-                (decision, now, approval_id),
+                (decision, now, respond_row["approval_id"]),
             )
+            if sibling_id:
+                conn.execute(
+                    """
+                    UPDATE approvals
+                    SET status='sent', decision=?, decided_at=?, decided_by='watch'
+                    WHERE approval_id=?
+                    """,
+                    (decision, now, sibling_id),
+                )
             conn.commit()
         finally:
             conn.close()
-        log.info("DECISION sent id=%s decision=%s", approval_id, decision)
+        log.info("DECISION sent id=%s (daemon=%s) decision=%s", approval_id, respond_row["approval_id"], decision)
         return {
             "ok": True,
             "approval_id": approval_id,

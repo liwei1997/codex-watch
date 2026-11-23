@@ -360,9 +360,10 @@ Page(
       )
 
       const approveItem = {
+        key: 'accept',
         button: addButton(
           'APPROVE', 70, 288, 105, 52,
-          () => approval.actionable !== false && self.decisionAction('accept'),
+          () => self.decisionAction('accept'),
           {
             normalColor: COLORS.green,
             pressColor: COLORS.greenPress,
@@ -374,9 +375,10 @@ Page(
       }
 
       const rejectItem = {
+        key: 'decline',
         button: addButton(
           'REJECT', 188, 288, 105, 52,
-          () => approval.actionable !== false && self.decisionAction('decline'),
+          () => self.decisionAction('decline'),
           {
             normalColor: COLORS.red,
             pressColor: COLORS.redPress,
@@ -388,6 +390,7 @@ Page(
       }
 
       const cancelItem = {
+        key: 'cancel',
         button: addButton(
           'CANCEL', 306, 288, 105, 52,
           () => self.overlay && self.overlay.close(),
@@ -455,14 +458,19 @@ Page(
           }
 
           try {
-            b.button.setProperty(
-              prop.MORE, { x: px(-1000), y: px(-1000) }
-            )
-            b.button.setProperty(prop.MORE, { text: '' })
-            b.button.setEnable(false)
-            console.log(TAG + ' Overlay button hidden')
+            deleteWidget(b.button)
+            console.log(TAG + ' Overlay button deleted')
           } catch (error) {
-            console.log(TAG + ' Overlay button hide failed: ' + String(error))
+            console.log(TAG + ' Overlay button delete failed: ' + String(error))
+            try {
+              b.button.setProperty(
+                prop.MORE, { x: px(-1000), y: px(-1000) }
+              )
+              b.button.setProperty(prop.MORE, { text: '' })
+              b.button.setEnable(false)
+            } catch (fallbackError) {
+              console.log(TAG + ' Overlay button hide failed: ' + String(fallbackError))
+            }
           }
           try {
             deleteWidget(b.focusFrame)
@@ -496,9 +504,10 @@ Page(
         }
 
         if (action === 'select') {
-          if (overlay.selected === 0) {
+          const key = buttons[overlay.selected] && buttons[overlay.selected].key
+          if (key === 'accept') {
             self.decisionAction('accept')
-          } else if (overlay.selected === 1) {
+          } else if (key === 'decline') {
             self.decisionAction('decline')
           } else {
             overlay.close()
@@ -535,7 +544,11 @@ Page(
 
       console.log(TAG + ' decisionAction ' + decision + (overlay ? ' for ' + overlay.approval.approval_id : ' (no overlay)'))
 
-      if (!overlay || overlay.busy) {
+      if (!overlay) {
+        return
+      }
+      if (overlay.busy) {
+        overlay.setStatus('BUSY — WAITING FOR SERVER', COLORS.orangeText)
         return
       }
       if (overlay.approval.actionable === false) {
@@ -889,6 +902,25 @@ Page(
         this.overlay.widgets.forEach((w) => {
           try {
             deleteWidget(w)
+          } catch (error) {
+            // ignore
+          }
+        })
+
+        this.overlay.buttons.forEach((item) => {
+          const b = item.button
+
+          if (!b) {
+            return
+          }
+
+          try {
+            deleteWidget(b.button)
+          } catch (error) {
+            // ignore
+          }
+          try {
+            deleteWidget(b.focusFrame)
           } catch (error) {
             // ignore
           }

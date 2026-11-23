@@ -24,6 +24,7 @@ import uuid
 import time
 import hmac
 import sqlite3
+import threading
 import logging
 
 from pathlib import Path
@@ -255,6 +256,9 @@ def store_event(data):
 # Out-of-band approvals (Codex notify hook)
 # --------------------------------------------------
 
+NOTIFY_PUSH_DELAY = 60
+
+
 def store_notify_approval(data):
     """Store a PENDING approval reported by the Codex notify hook
     (approval-requested). The hook does not see the app-server request,
@@ -286,7 +290,7 @@ def store_notify_approval(data):
 
     conn = connect_db()
     try:
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO approvals (
                 approval_id, request_id, thread_id, turn_id, item_id,
@@ -312,15 +316,77 @@ def store_notify_approval(data):
             ),
         )
         conn.commit()
+        fresh = cur.rowcount > 0
     finally:
         conn.close()
 
-    # /v1/events only surfaces approval_request events that have a matching
-    # PENDING approvals row, so create the event with the linked id.
+    log.info(
+        "NOTIFY-APPROVAL pending id=%s thread=%s kind=%s cmd=%s (fresh=%s)",
+        approval_id, thread_id, kind, (command or "")[:120], fresh,
+    )
+
+    # Delay the push: only notify the watch if the approval is still pending
+    # after NOTIFY_PUSH_DELAY seconds (i.e. the user has not answered in the
+    # Codex terminal). Mirrors the daemon path's grace period.
+    if fresh:
+        threading.Timer(
+            NOTIFY_PUSH_DELAY,
+            _push_notify_approval,
+            args=(approval_id, thread_id, turn_id, kind, command, cwd, reason, available),
+            daemon=True,
+        ).start()
+
+    return {"ok": True, "approval_id": approval_id, "event_id": "appr-" + approval_id}
+
+
+def _push_notify_approval(approval_id, thread_id, turn_id, kind, command, cwd, reason, available):
+    """Push a notify-hook approval to the watch only if it is still pending and
+    no daemon-path row is already covering the same turn (avoids duplicate cards)."""
+    conn = connect_db()
+    try:
+        row = conn.execute(
+            "SELECT status FROM approvals WHERE approval_id=?", (approval_id,)
+        ).fetchone()
+        if not row or row["status"] != "pending":
+            log.info(
+                "notify approval %s no longer pending (status=%s), skip push",
+                approval_id, row["status"] if row else "missing",
+            )
+            return
+        if turn_id:
+            sib = conn.execute(
+                """
+                SELECT 1 FROM approvals
+                WHERE thread_id=? AND turn_id=?
+                  AND request_id NOT LIKE 'notify:%'
+                  AND status IN ('pending','sent')
+                LIMIT 1
+                """,
+                (thread_id, turn_id),
+            ).fetchone()
+        else:
+            sib = conn.execute(
+                """
+                SELECT 1 FROM approvals
+                WHERE thread_id=?
+                  AND request_id NOT LIKE 'notify:%'
+                  AND status IN ('pending','sent')
+                  AND command=?
+                LIMIT 1
+                """,
+                (thread_id, command),
+            ).fetchone()
+        if sib:
+            log.info("notify approval %s has daemon sibling, skip duplicate push", approval_id)
+            return
+    finally:
+        conn.close()
+
     project = os.path.basename(cwd) if cwd else "codex"
     body = (command or reason or kind).strip().replace("\n", " ")
     if len(body) > 160:
         body = body[:157] + "..."
+    now = int(time.time())
 
     try:
         store_event({
@@ -344,15 +410,9 @@ def store_notify_approval(data):
             "created_at": now,
             "expires_at": None,
         })
+        log.info("notify approval %s pushed to watch (still pending after %ds)", approval_id, NOTIFY_PUSH_DELAY)
     except ValueError as exc:
         log.warning("approval event store failed: %r", exc)
-
-    log.info(
-        "NOTIFY-APPROVAL pending id=%s thread=%s kind=%s cmd=%s",
-        approval_id, thread_id, kind, (command or "")[:120],
-    )
-
-    return {"ok": True, "approval_id": approval_id, "event_id": "appr-" + approval_id}
 
 
 def resolve_thread_approvals(thread_id):
