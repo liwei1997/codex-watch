@@ -23,7 +23,7 @@ import {
 //   -> Cloudflare Tunnel
 //   -> Ubuntu Bridge
 //
-// Polls once per minute.
+// Polls every 10 seconds while the Zepp OS background service is running.
 //
 //   * approval_request events become system notifications
 //     with APPROVE / REJECT action buttons that launch
@@ -35,7 +35,8 @@ import {
 
 const TAG = '[Codex Watch Background]'
 
-const POLL_LIMIT = 20
+const POLL_LIMIT = 5
+const POLL_INTERVAL_MS = 10_000
 const MAX_BODY_LENGTH = 160
 const MAX_APPROVAL_TITLE = 40
 const MAX_APPROVAL_CONTENT = 120
@@ -57,6 +58,7 @@ const phoneRequest = createSystemRequestRunner({
 let pollRunning = false
 let destroyed = false
 let minuteCount = 0
+let pollTimerId = null
 
 // Prevent repeated notifications in the current service instance
 // when the notification succeeded but the ACK failed.
@@ -213,20 +215,26 @@ AppService(
       // Run an initial poll when the background service starts.
       service.pollBridge()
 
-      // Poll on each minute tick.
+      // System timer handles sub-minute polling when the service is alive.
+      // Keep the minute sensor as a fallback in case the periodic timer is
+      // throttled by the OS; pollRunning prevents concurrent requests.
+      try {
+        pollTimerId = createSysTimer(
+          true,
+          POLL_INTERVAL_MS,
+          () => service.pollBridge()
+        )
+        log('fast polling registered: ' + POLL_INTERVAL_MS + 'ms')
+      } catch (error) {
+        log('fast polling unavailable: ' + errorText(error))
+      }
+
       timeSensor.onPerMinute(() => {
-        if (destroyed) {
-          return
-        }
-
+        if (destroyed) return
         minuteCount++
-
-        log('minute tick=' + minuteCount)
-
+        log('minute fallback tick=' + minuteCount)
         service.pollBridge()
       })
-
-      log('minute polling registered')
     },
 
     async pollBridge() {
@@ -274,55 +282,45 @@ AppService(
 
         log('Poll OK, count=' + events.length)
 
-        if (events.length > 0) {
-          // First version processes one event per cycle.
-          // Remaining events stay in the Bridge queue.
-          const item = events[0]
-
+        // Drain the small batch, with approvals sorted first by Bridge.
+        // ACK only after notify() reports success.
+        for (const item of events) {
+          if (destroyed) break
           const eventId = String(item.event_id || '')
-
           if (!eventId) {
-            throw new Error('Received event without event_id')
+            log('Skipping event without event_id')
+            continue
           }
 
-          log('Received event: ' + eventId)
-
-          const notificationCreated = sendSystemNotification(item)
-
-          if (notificationCreated) {
-            // Only ACK after the notification was created.
-            try {
-              const ack = await phoneRequest.run(
-                'bridge.ack',
-                () => this.request(
-                  {
-                    method: 'bridge.ack',
-                    params: {
-                      event_id: eventId,
-                      consumer_id: 'iphone',
-                      stage: 'watch_received'
-                    }
-                  },
-                  {
-                    timeout: PHONE_REQUEST_TIMEOUT
-                  }
-                )
-              )
-
-              if (!ack || ack.ok !== true) {
-                throw new Error('Invalid ACK response')
-              }
-
-              log('Watch ACK OK: ' + eventId)
-
-              // Release in-memory tracking after successful ACK.
-              delete notifiedEvents[eventId]
-
-            } catch (ackError) {
-              log('ACK failed: ' + errorText(ackError))
+          try {
+            log('Received event: ' + eventId)
+            if (!sendSystemNotification(item)) {
+              log('Notification failed, ACK skipped: ' + eventId)
+              continue
             }
-          } else {
-            log('Notification failed, ACK skipped')
+
+            const ack = await phoneRequest.run(
+              'bridge.ack',
+              () => this.request(
+                {
+                  method: 'bridge.ack',
+                  params: {
+                    event_id: eventId,
+                    consumer_id: 'iphone',
+                    stage: 'watch_received'
+                  }
+                },
+                { timeout: PHONE_REQUEST_TIMEOUT }
+              )
+            )
+
+            if (!ack || ack.ok !== true) {
+              throw new Error('Invalid ACK response')
+            }
+            log('Watch ACK OK: ' + eventId)
+            delete notifiedEvents[eventId]
+          } catch (eventError) {
+            log('Delivery failed for ' + eventId + ': ' + errorText(eventError))
           }
         }
 
@@ -410,6 +408,14 @@ AppService(
 
     onDestroy() {
       destroyed = true
+      if (pollTimerId !== null) {
+        try {
+          stopTimer(pollTimerId)
+        } catch (error) {
+          log('poll timer cleanup failed: ' + errorText(error))
+        }
+        pollTimerId = null
+      }
 
       log('destroyed')
     }
