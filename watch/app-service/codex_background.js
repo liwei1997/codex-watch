@@ -118,6 +118,7 @@ function sendSystemNotification(event) {
 
   const isApproval = event.type === 'approval_request'
   const payload = event.payload || {}
+  const actionableApproval = isApproval && event.source !== 'codex-notify'
   const approvalId = isApproval
     ? String(payload.approval_id || '')
     : ''
@@ -138,7 +139,7 @@ function sendSystemNotification(event) {
       MAX_APPROVAL_CONTENT
     )
 
-    actions = [
+    actions = actionableApproval ? [
       {
         text: 'APPROVE',
         file: ACTION_SERVICE,
@@ -149,9 +150,12 @@ function sendSystemNotification(event) {
         file: ACTION_SERVICE,
         param: buildApprovalActionParam(approvalId, 'decline')
       }
-    ]
+    ] : []
 
     vibrate = 1
+    if (!actionableApproval) {
+      content = cut(content + ' (approve in Codex terminal)', MAX_APPROVAL_CONTENT)
+    }
 
     log('Approval notification: ' + approvalId)
   }
