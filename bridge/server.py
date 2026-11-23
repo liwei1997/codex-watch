@@ -293,14 +293,7 @@ def store_notify_approval(data):
                 method, kind, command, cwd, reason, available_decisions,
                 status, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-            ON CONFLICT(thread_id, request_id) DO UPDATE SET
-                status = 'pending',
-                decision = NULL,
-                decided_at = NULL,
-                decided_by = NULL,
-                command = excluded.command,
-                reason = excluded.reason,
-                created_at = excluded.created_at
+            ON CONFLICT(thread_id, request_id) DO NOTHING
             """,
             (
                 approval_id,
@@ -349,7 +342,7 @@ def store_notify_approval(data):
                 "available_decisions": available,
             },
             "created_at": now,
-            "expires_at": now + TASK_COMPLETED_TTL,
+            "expires_at": None,
         })
     except ValueError as exc:
         log.warning("approval event store failed: %r", exc)
@@ -671,6 +664,7 @@ class Handler(BaseHTTPRequestHandler):
                     "reason": row["reason"],
                     "status": row["status"],
                     "decision": row["decision"],
+                    "actionable": not str(row["request_id"]).startswith("notify:"),
                     "decided_by": row["decided_by"],
                     "created_at": row["created_at"],
                 })
