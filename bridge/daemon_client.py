@@ -510,6 +510,8 @@ class DaemonClient:
             return {"ok": False, "error": "approval not found"}
         if row["status"] not in ("pending", "sent"):
             return {"ok": False, "error": "approval already %s" % row["status"]}
+        if str(row["request_id"]).startswith("notify:"):
+            return {"ok": False, "error": "notification-only approval has no daemon request id; approve in Codex terminal"}
 
         try:
             # Daemon server-request id is a JSON integer, but request_id is stored
