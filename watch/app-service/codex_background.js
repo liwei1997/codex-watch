@@ -120,10 +120,14 @@ function sendSystemNotification(event) {
 
   const isApproval = event.type === 'approval_request'
   const payload = event.payload || {}
-  const actionableApproval = isApproval && event.source !== 'codex-notify'
   const approvalId = isApproval
     ? String(payload.approval_id || '')
     : ''
+  // The bridge tags real Codex notify-hook approvals with source
+  // "codex-notify", and its /v1/approvals marks them non-actionable,
+  // but its decision endpoint handles them normally. If the watch
+  // can name the approval, it can decide it.
+  const actionableApproval = isApproval && approvalId !== ''
 
   let title = String(event.title || 'Codex Watch').slice(0, 60)
   let content = buildNotificationContent(event)
