@@ -149,6 +149,25 @@ Page(
     },
 
     // ----------------------------------------------------------
+    // Text updates
+    // ----------------------------------------------------------
+
+    setWidgetText(textWidget, text, color) {
+      try {
+        if (color === undefined) {
+          textWidget.setProperty(prop.MORE, { text: text })
+        } else {
+          textWidget.setProperty(
+            prop.MORE, { text: text, color: color }
+          )
+        }
+      } catch (error) {
+        textWidget.text = text
+        textWidget.color = color
+      }
+    },
+
+    // ----------------------------------------------------------
     // List rendering
     // ----------------------------------------------------------
 
@@ -263,9 +282,9 @@ Page(
 
       // Recent (resolved/expired)
       if (this.recent.length === 0) {
-        this.recentText.text = 'No recent decisions.'
+        this.setWidgetText(this.recentText, 'No recent decisions.')
       } else {
-        this.recentText.text = this.recent
+        this.setWidgetText(this.recentText, this.recent
           .map((a) => {
             const label =
               a.status === 'expired'
@@ -280,6 +299,7 @@ Page(
             )
           })
           .join('\n')
+        )
       }
 
       if (this.actionable.length === 0) {
@@ -404,8 +424,7 @@ Page(
       }
 
       overlay.setStatus = (text, color) => {
-        status.text = text
-        status.color = color
+        self.setWidgetText(status, text, color)
       }
 
       overlay.close = () => {
@@ -436,11 +455,15 @@ Page(
           }
 
           try {
-            deleteWidget(b.button)
+            b.button.setProperty(
+              prop.MORE, { x: px(-1000), y: px(-1000) }
+            )
+            b.button.setProperty(prop.MORE, { text: '' })
+            b.button.setEnable(false)
+            console.log(TAG + ' Overlay button hidden')
           } catch (error) {
-            // ignore
+            console.log(TAG + ' Overlay button hide failed: ' + String(error))
           }
-
           try {
             deleteWidget(b.focusFrame)
           } catch (error) {
@@ -510,6 +533,8 @@ Page(
     decisionAction(decision) {
       const overlay = this.overlay
 
+      console.log(TAG + ' decisionAction ' + decision + (overlay ? ' for ' + overlay.approval.approval_id : ' (no overlay)'))
+
       if (!overlay || overlay.busy) {
         return
       }
@@ -527,6 +552,11 @@ Page(
 
     async sendDecision(overlay, decision) {
       const approval = overlay.approval
+      const startedAt = Date.now()
+
+      console.log(
+        TAG + ' sendDecision start ' + decision + ' ' + approval.approval_id
+      )
 
       try {
         const result = await this.request(
@@ -538,6 +568,12 @@ Page(
             }
           },
           { timeout: REQUEST_TIMEOUT }
+        )
+
+        console.log(
+          TAG + ' sendDecision result ' +
+          (result && result.ok === true ? 'ok' : 'not-ok') +
+          ' after ' + (Date.now() - startedAt) + 'ms'
         )
 
         if (this.destroyed) {
@@ -584,6 +620,12 @@ Page(
         }
 
       } catch (error) {
+        console.log(
+          TAG + ' sendDecision failed after ' +
+          (Date.now() - startedAt) + 'ms: ' +
+          String(error && error.message ? error.message : error)
+        )
+
         if (this.destroyed) {
           return
         }
@@ -658,9 +700,16 @@ Page(
           throw new Error('Invalid response from phone')
         }
 
-        this.all = Array.isArray(result.approvals)
+        this.all = (Array.isArray(result.approvals)
           ? result.approvals
           : []
+        ).map((a) => {
+          if (a && a.status === 'pending' &&
+              String(a.approval_id || '') !== '') {
+            a.actionable = true
+          }
+          return a
+        })
 
         this.actionable = this.all.filter(
           (a) => a.status === 'pending'
@@ -702,9 +751,11 @@ Page(
 
       } catch (error) {
         if (!this.destroyed) {
-          this.status.text =
-            'CONNECTION FAILED · ' + shortError(error, 18)
-          this.status.color = COLORS.redText
+          this.setWidgetText(
+            this.status,
+            'CONNECTION FAILED · ' + shortError(error, 18),
+            COLORS.redText
+          )
           this.scheduleFastRetry()
         }
         console.log(
