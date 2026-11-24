@@ -2,381 +2,139 @@ import { BasePage } from '@zeppos/zml/base-page'
 import { notify, cancel } from '@zos/notification'
 import { Time } from '@zos/sensor'
 import { createSysTimer, stopTimer } from '@zos/timer'
-
 import { createSystemRequestRunner } from './system_request_runner'
-
-import {
-  cleanCommand,
-  projectOf,
-  buildApprovalActionParam
-} from '../common/format'
-
+import { cleanCommand, projectOf, buildApprovalActionParam } from '../common/format'
 
 const TAG = '[Codex Watch Background]'
-
-const POLL_LIMIT = 5
-const POLL_INTERVAL_MS = 10_000
-const MAX_BODY_LENGTH = 160
-const MAX_APPROVAL_TITLE = 40
-const MAX_APPROVAL_CONTENT = 120
-const PHONE_REQUEST_TIMEOUT = 15000
-
+const POLL_INTERVAL_MS = 10000
+const REQUEST_TIMEOUT = 15000
 const ACTION_SERVICE = 'app-service/approval_action'
-
+const REPLY_PAGE = 'page/reply'
 const timeSensor = new Time()
-
 const phoneRequest = createSystemRequestRunner({
-  timeoutMs: PHONE_REQUEST_TIMEOUT,
+  timeoutMs: REQUEST_TIMEOUT,
   createTimer: createSysTimer,
   stopTimer
 })
 
 let pollRunning = false
 let destroyed = false
-let minuteCount = 0
 let pollTimerId = null
-
-const notifiedEvents = {}
-
 const approvalNotifications = {}
 
 function log(message) {
   console.log(TAG + ' ' + message)
 }
 
-function errorText(error) {
-  if (error && error.message) {
-    return String(error.message)
-  }
-
-  return String(error)
-}
-
-function cut(text, max) {
-  const s = String(text === null || text === undefined ? '' : text)
-
-  if (s.length <= max) {
-    return s
-  }
-
-  return s.slice(0, max - 3) + '...'
-}
-
-function buildNotificationContent(event) {
-  const type = String(event.type || 'event')
-
-  const machine = String(event.machine_id || 'unknown')
-
-  const body = String(event.body || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  if (!body) {
-    return type + ' · ' + machine
-  }
-
-  return cut(body, MAX_BODY_LENGTH)
-}
-
-function sendSystemNotification(event) {
-  const eventId = String(event.event_id || '')
-
-  if (!eventId) {
-    throw new Error('Missing event_id')
-  }
-
-  if (notifiedEvents[eventId]) {
-    log('Already notified: ' + eventId)
-    return true
-  }
-
-  const isApproval = event.type === 'approval_request'
+function notifyEvent(event) {
   const payload = event.payload || {}
-  const approvalId = isApproval
-    ? String(payload.approval_id || '')
-    : ''
-  const actionableApproval = isApproval && approvalId !== ''
-
-  let title = String(event.title || 'Codex Watch').slice(0, 60)
-  let content = buildNotificationContent(event)
-  let actions = []
-  let vibrate = 0
-
-  if (isApproval && approvalId) {
-    title = cut(
-      'APPROVAL · ' + projectOf(payload.cwd),
-      MAX_APPROVAL_TITLE
-    )
-
-    content = cut(
-      cleanCommand(payload.command) || content,
-      MAX_APPROVAL_CONTENT
-    )
-
-    actions = actionableApproval ? [
-      {
-        text: 'APPROVE',
-        file: ACTION_SERVICE,
-        param: buildApprovalActionParam(approvalId, 'accept')
-      },
-      {
-        text: 'REJECT',
-        file: ACTION_SERVICE,
-        param: buildApprovalActionParam(approvalId, 'decline')
-      }
-    ] : []
-
-    vibrate = 1
-    if (!actionableApproval) {
-      content = cut(content + ' (approve in Codex terminal)', MAX_APPROVAL_CONTENT)
-    }
-
-    log('Approval notification: ' + approvalId)
-  }
-
-  log('Creating notification: ' + eventId)
-
+  const approval = event.type === 'approval_request'
+  const id = String(approval ? payload.approval_id || '' : '')
+  const title = approval
+    ? 'APPROVAL · ' + projectOf(payload.cwd)
+    : String(event.title || 'CODEX')
+  const content = approval
+    ? cleanCommand(payload.command) || event.body || 'Approval required'
+    : String(event.body || 'Codex turn completed').replace(/\s+/g, ' ').trim().slice(0, 160)
+  const actions = approval && id ? [
+    { text: 'APPROVE', file: ACTION_SERVICE, param: buildApprovalActionParam(id, 'accept') },
+    { text: 'REJECT', file: ACTION_SERVICE, param: buildApprovalActionParam(id, 'decline') }
+  ] : [{
+    text: 'REPLY',
+    file: REPLY_PAGE,
+    param: JSON.stringify({
+      thread_id: String(payload.thread_id || ''),
+      project: projectOf(payload.cwd),
+      event_id: String(event.event_id || '')
+    })
+  }]
   const notificationId = notify({
-    title,
-    content,
+    title: title.slice(0, 60),
+    content: content.slice(0, 160),
     actions,
-    vibrate
+    vibrate: approval ? 1 : 0
   })
-
-  log('notify id=' + notificationId)
-
-  if (!notificationId) {
-    log('Notification creation failed')
-    return false
+  if (!notificationId) return false
+  if (approval && id) {
+    approvalNotifications[id] = notificationId
   }
-
-  notifiedEvents[eventId] = true
-
-  if (isApproval && approvalId) {
-    approvalNotifications[approvalId] = {
-      event_id: eventId,
-      notification_id: notificationId
-    }
-  }
-
-  log('Notification created: ' + eventId)
-
   return true
 }
 
+AppService(BasePage({
+  state: {},
+  build() {},
 
-AppService(
-  BasePage({
-    state: {},
-
-    build() {},
-
-    onInit() {
-      destroyed = false
-      pollRunning = false
-      minuteCount = 0
-
-      log('started')
-
-      const service = this
-
-      service.pollBridge()
-
-      try {
-        pollTimerId = createSysTimer(
-          true,
-          POLL_INTERVAL_MS,
-          () => service.pollBridge()
-        )
-        log('fast polling registered: ' + POLL_INTERVAL_MS + 'ms')
-      } catch (error) {
-        log('fast polling unavailable: ' + errorText(error))
-      }
-
-      timeSensor.onPerMinute(() => {
-        if (destroyed) return
-        minuteCount++
-        log('minute fallback tick=' + minuteCount)
-        service.pollBridge()
-      })
-    },
-
-    async pollBridge() {
-      if (destroyed) {
-        return
-      }
-
-      if (pollRunning) {
-        log('Poll skipped: previous request pending')
-        return
-      }
-
-      pollRunning = true
-
-      try {
-        log('Requesting bridge.poll')
-
-        const result = await phoneRequest.run(
-          'bridge.poll',
-          () => this.request(
-            {
-              method: 'bridge.poll',
-              params: {
-                consumer_id: 'iphone',
-                limit: POLL_LIMIT
-              }
-            },
-            {
-              timeout: PHONE_REQUEST_TIMEOUT
-            }
-          )
-        )
-
-        if (destroyed) {
-          return
-        }
-
-        if (!result || result.ok !== true) {
-          throw new Error('Invalid bridge.poll response')
-        }
-
-        const events = Array.isArray(result.events)
-          ? result.events
-          : []
-
-        log('Poll OK, count=' + events.length)
-
-        for (const item of events) {
-          if (destroyed) break
-          const eventId = String(item.event_id || '')
-          if (!eventId) {
-            log('Skipping event without event_id')
-            continue
-          }
-
-          try {
-            log('Received event: ' + eventId)
-            if (!sendSystemNotification(item)) {
-              log('Notification failed, ACK skipped: ' + eventId)
-              continue
-            }
-
-            const ack = await phoneRequest.run(
-              'bridge.ack',
-              () => this.request(
-                {
-                  method: 'bridge.ack',
-                  params: {
-                    event_id: eventId,
-                    consumer_id: 'iphone',
-                    stage: 'watch_received'
-                  }
-                },
-                { timeout: PHONE_REQUEST_TIMEOUT }
-              )
-            )
-
-            if (!ack || ack.ok !== true) {
-              throw new Error('Invalid ACK response')
-            }
-            log('Watch ACK OK: ' + eventId)
-            delete notifiedEvents[eventId]
-          } catch (eventError) {
-            log('Delivery failed for ' + eventId + ': ' + errorText(eventError))
-          }
-        }
-
-        if (Object.keys(approvalNotifications).length > 0) {
-          await this.checkStaleApprovals()
-        }
-
-      } catch (error) {
-        log('Poll failed: ' + errorText(error))
-
-      } finally {
-        pollRunning = false
-      }
-    },
-
-    async checkStaleApprovals() {
-      const tracked = Object.keys(approvalNotifications)
-
-      if (tracked.length === 0 || destroyed) {
-        return
-      }
-
-      try {
-        const result = await phoneRequest.run(
-          'bridge.approval.list',
-          () => this.request(
-            {
-              method: 'bridge.approval.list',
-              params: {
-                status: 'pending',
-                limit: 50
-              }
-            },
-            {
-              timeout: PHONE_REQUEST_TIMEOUT
-            }
-          )
-        )
-
-        if (destroyed) {
-          return
-        }
-
-        if (!result || result.ok !== true ||
-          !Array.isArray(result.approvals)) {
-          return
-        }
-
-        const stillPending = {}
-
-        result.approvals.forEach((approval) => {
-          stillPending[String(approval.approval_id)] = true
-        })
-
-        tracked.forEach((approvalId) => {
-          const entry = approvalNotifications[approvalId]
-
-          if (!entry || stillPending[approvalId]) {
-            return
-          }
-
-          try {
-            cancel([entry.notification_id])
-            log(
-              'Cancelled stale approval notification: ' +
-              approvalId + ' id=' + entry.notification_id
-            )
-          } catch (cancelError) {
-            log(
-              'Cancel failed for ' + approvalId +
-              ': ' + errorText(cancelError)
-            )
-          }
-
-          delete approvalNotifications[approvalId]
-        })
-
-      } catch (error) {
-        log('Stale check failed: ' + errorText(error))
-      }
-    },
-
-    onDestroy() {
-      destroyed = true
-      if (pollTimerId !== null) {
-        try {
-          stopTimer(pollTimerId)
-        } catch (error) {
-          log('poll timer cleanup failed: ' + errorText(error))
-        }
-        pollTimerId = null
-      }
-
-      log('destroyed')
+  onInit() {
+    destroyed = false
+    pollRunning = false
+    this.pollBridge()
+    try {
+      pollTimerId = createSysTimer(true, POLL_INTERVAL_MS, () => this.pollBridge())
+    } catch (error) {
+      log('poll timer unavailable: ' + String(error))
     }
-  })
-)
+    timeSensor.onPerMinute(() => {
+      if (!destroyed) this.pollBridge()
+    })
+  },
+
+  async pollBridge() {
+    if (destroyed || pollRunning) return
+    pollRunning = true
+    try {
+      const result = await phoneRequest.run(
+        'bridge.poll',
+        () => this.request({ method: 'bridge.poll', params: { limit: 20 } }, { timeout: REQUEST_TIMEOUT })
+      )
+      if (destroyed || !result || result.ok !== true) return
+      for (const event of result.notifications || []) {
+        if (destroyed) break
+        try {
+          if (!notifyEvent(event)) continue
+          await phoneRequest.run(
+            'bridge.notification.ack',
+            () => this.request({
+              method: 'bridge.notification.ack',
+              params: { event_id: event.event_id }
+            }, { timeout: REQUEST_TIMEOUT })
+          )
+        } catch (error) {
+          log('delivery failed: ' + String(error))
+        }
+      }
+      if (Object.keys(approvalNotifications).length) {
+        await this.checkStaleApprovals()
+      }
+    } catch (error) {
+      log('poll failed: ' + String(error))
+    } finally {
+      pollRunning = false
+    }
+  },
+
+  async checkStaleApprovals() {
+    const result = await phoneRequest.run(
+      'bridge.approval.list',
+      () => this.request({
+        method: 'bridge.approval.list',
+        params: { status: 'pending', limit: 50 }
+      }, { timeout: REQUEST_TIMEOUT })
+    )
+    if (destroyed || !result || result.ok !== true) return
+    const pending = new Set((result.approvals || []).map(item => String(item.approval_id)))
+    Object.keys(approvalNotifications).forEach(id => {
+      if (pending.has(id)) return
+      cancel([approvalNotifications[id]])
+      delete approvalNotifications[id]
+    })
+  },
+
+  onDestroy() {
+    destroyed = true
+    if (pollTimerId !== null) {
+      try { stopTimer(pollTimerId) } catch (error) {}
+      pollTimerId = null
+    }
+  }
+}))

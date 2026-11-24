@@ -667,13 +667,10 @@ Page(
         this.all = (Array.isArray(result.approvals)
           ? result.approvals
           : []
-        ).map((a) => {
-          if (a && a.status === 'pending' &&
-              String(a.approval_id || '') !== '') {
-            a.actionable = true
-          }
-          return a
-        })
+        ).map((a) => ({
+          ...a,
+          actionable: a.status === 'pending' && Number.isInteger(Number(a.request_id))
+        }))
 
         this.actionable = this.all.filter(
           (a) => a.status === 'pending'
