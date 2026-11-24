@@ -5,8 +5,8 @@
     "appName": "Codex Watch",
     "appType": "app",
     "version": {
-      "code": 17,
-      "name": "1.1.14"
+      "code": 18,
+      "name": "1.1.15"
     },
     "icon": "icon.png",
     "vender": "zepp",

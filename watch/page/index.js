@@ -13,6 +13,7 @@ import { push } from '@zos/router'
 
 import { requestPermission } from '@zos/app'
 import { start } from '@zos/app-service'
+import { createSysTimer, stopTimer } from '@zos/timer'
 
 import {
   COLORS,
@@ -93,6 +94,46 @@ function launchBackgroundService() {
     backgroundStartInFlight = false
     console.log(TAG + ' Background exception: ' + String(error))
   }
+}
+
+function raceTimeout(promise, ms, label) {
+  return new Promise(function (resolve, reject) {
+    let done = false
+    let timerId = null
+
+    function settle(callback, value) {
+      if (done) {
+        return
+      }
+      done = true
+      if (timerId !== null) {
+        try {
+          stopTimer(timerId)
+        } catch (error) {
+        }
+        timerId = null
+      }
+      callback(value)
+    }
+
+    try {
+      timerId = createSysTimer(false, ms, function () {
+        timerId = null
+        settle(reject, new Error(label + ' timed out after ' + ms + 'ms'))
+      })
+    } catch (error) {
+      timerId = null
+    }
+
+    Promise.resolve(promise).then(
+      (value) => {
+        settle(resolve, value)
+      },
+      (error) => {
+        settle(reject, error)
+      }
+    )
+  })
 }
 
 function startCodexBackground() {
@@ -367,15 +408,62 @@ Page(BasePage({
     this.busyLoad = true
     this.lastLoadAt = now
 
-    const jsProbe = this.probePhoneJs()
+    const jsProbe = raceTimeout(
+      this.probePhoneJs(),
+      8000,
+      'phone probe'
+    )
 
-    jsProbe.then((label) => {
-      if (this.destroyed || !this.linkStatus) {
-        return
+    jsProbe.then(
+      (label) => {
+        if (this.destroyed || !this.linkStatus) {
+          return
+        }
+        if (this.linkStatus.text.indexOf('SYNCING') === 0) {
+          this.setLinkStatus('SYNCING... · ' + label, COLORS.muted)
+        }
+      },
+      () => {}
+    )
+
+    const approvalsP = raceTimeout(
+      this.request(
+        {
+          method: 'bridge.approval.list',
+          params: { status: 'pending', limit: 5 }
+        },
+        { timeout: REQUEST_TIMEOUT }
+      ),
+      REQUEST_TIMEOUT,
+      'approval.list'
+    ).then((approvalResult) => {
+      if (!approvalResult || approvalResult.ok !== true) {
+        throw new Error('bad approval response')
       }
-      if (this.linkStatus.text.indexOf('SYNCING') === 0) {
-        this.setLinkStatus('SYNCING... · ' + label, COLORS.muted)
+
+      return Array.isArray(approvalResult.approvals)
+        ? approvalResult.approvals
+        : []
+    })
+
+    const eventsP = raceTimeout(
+      this.request(
+        {
+          method: 'bridge.history',
+          params: { consumer_id: 'iphone', limit: 20 }
+        },
+        { timeout: REQUEST_TIMEOUT }
+      ),
+      REQUEST_TIMEOUT,
+      'history'
+    ).then((historyResult) => {
+      if (!historyResult || historyResult.ok !== true) {
+        throw new Error('bad history response')
       }
+
+      return Array.isArray(historyResult.events)
+        ? historyResult.events
+        : []
     })
 
     let approvals = null
@@ -384,43 +472,22 @@ Page(BasePage({
     let historyError = null
 
     try {
-      const approvalResult = await this.request(
-        {
-          method: 'bridge.approval.list',
-          params: { status: 'pending', limit: 5 }
-        },
-        { timeout: REQUEST_TIMEOUT }
-      )
-
-      if (!approvalResult || approvalResult.ok !== true) {
-        throw new Error('bad approval response')
-      }
-
-      approvals = Array.isArray(approvalResult.approvals)
-        ? approvalResult.approvals
-        : []
+      approvals = await approvalsP
     } catch (error) {
       approvalsError = error
     }
 
     try {
-      const historyResult = await this.request(
-        {
-          method: 'bridge.history',
-          params: { consumer_id: 'iphone', limit: 20 }
-        },
-        { timeout: REQUEST_TIMEOUT }
-      )
-
-      if (!historyResult || historyResult.ok !== true) {
-        throw new Error('bad history response')
-      }
-
-      events = Array.isArray(historyResult.events)
-        ? historyResult.events
-        : []
+      events = await eventsP
     } catch (error) {
       historyError = error
+    }
+
+    let probeDown = false
+    try {
+      await jsProbe
+    } catch (error) {
+      probeDown = true
     }
 
     this.busyLoad = false
@@ -438,10 +505,14 @@ Page(BasePage({
     }
 
     if (approvalsError && historyError) {
-      this.setLinkStatus(
-        'OFFLINE ' + shortError(approvalsError, 12),
-        COLORS.redText
-      )
+      if (probeDown) {
+        this.setLinkStatus('OFFLINE PHONE APP', COLORS.redText)
+      } else {
+        this.setLinkStatus(
+          'OFFLINE ' + shortError(approvalsError, 12),
+          COLORS.redText
+        )
+      }
       this.scheduleFastRetry()
       console.log(
         TAG + ' Dashboard load failed: ' +
