@@ -34,6 +34,7 @@ INTERESTING_NOTIF = frozenset({
     "thread/deleted",
     "serverRequest/resolved",
     "turn/completed",
+    "turn/started",
 })
 
 PING_INTERVAL = 30

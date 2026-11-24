@@ -5,8 +5,8 @@
     "appName": "Codex Watch",
     "appType": "app",
     "version": {
-      "code": 19,
-      "name": "1.1.16"
+      "code": 20,
+      "name": "1.2.0"
     },
     "icon": "icon.png",
     "vender": "zepp",
@@ -30,7 +30,8 @@
           "pages": [
             "page/index",
             "page/inbox",
-            "page/approvals"
+            "page/approvals",
+            "page/reply"
           ]
         },
         "app-side": {

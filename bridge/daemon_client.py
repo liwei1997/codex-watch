@@ -1,50 +1,21 @@
 #!/usr/bin/env python3
-"""
-Codex app-server daemon client for the Codex Watch Bridge.
-
-Runs as a background thread inside the bridge process. It joins live codex
-threads as a *secondary* client (the TUI stays the primary client), forwards
-approval server-requests into the approvals table + events pipeline, and
-relays decisions from the watch back to the daemon.
-
-Protocol facts (all verified by the 2026-11-16 approval spike):
-  - A non-owner client can join a live thread with
-    thread/resume {threadId}. The rollout file needs ~2s after thread
-    creation; earlier attempts fail with "no rollout found" -> retry.
-  - Approval server-requests are broadcast to every connected client of the
-    thread; the FIRST response resolves the request for everyone.
-  - A client that joins AFTER the request was issued still receives
-    still-pending approval requests (daemon replay) -> restarting or
-    reconnecting the bridge never loses a pending approval.
-  - thread/status/changed is a GLOBAL broadcast (no thread membership
-    needed). Status {"type":"active","activeFlags":["waitingOnApproval"]}
-    marks a thread with a pending approval.
-  - serverRequest/resolved {threadId, requestId} broadcasts the resolution.
-  - thread/list indexes TUI/cli threads (source="cli" / "vscode") with
-    current status (idle / active / notLoaded).
-"""
 import json
 import logging
 import os
 import socket
-import sqlite3
 import threading
 import time
 import uuid
 
 from wsclient import WSClient
 
-log = logging.getLogger("codex-watch.daemon")
 
+log = logging.getLogger("codex-watch.daemon")
 DAEMON_SOCK = os.environ.get(
     "CODEX_DAEMON_SOCK",
     "/home/liwei/.codex/app-server-control/app-server-control.sock",
 )
-
-MACHINE_ID = os.getenv("CODEX_WATCH_MACHINE_ID", "ubuntu-main")
-
 ALL_SOURCE_KINDS = ["cli", "vscode", "exec", "appServer", "subAgent", "unknown"]
-
 APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
     "execCommandApproval",
@@ -52,77 +23,54 @@ APPROVAL_METHODS = {
     "applyPatchApproval",
     "item/permissions/requestApproval",
 }
-
 VALID_DECISIONS = ("accept", "decline", "cancel")
-
-EVENT_TTL = 3600
-APPROVAL_PUSH_DELAY = 60
-REJOIN_LIMIT = 20
-
-
-def _connect_db(db_path):
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 10000")
-    return conn
-
-
-def _bindable(value):
-    """Coerce a value to something sqlite3 can bind.
-
-    thread/list fields like 'name' can be dicts/lists; sqlite3 cannot
-    bind those, so fall back to a string representation.
-    """
-    if value is None or isinstance(value, (int, float, str, bytes)):
-        return value
-    try:
-        return str(value)
-    except Exception:
-        return None
+APPROVAL_PUSH_DELAY = int(os.getenv("CODEX_WATCH_NOTIFY_DELAY", "60"))
 
 
 class DaemonClient:
-    def __init__(self, db_path, event_sink=None, sock_path=DAEMON_SOCK):
-        self.db_path = db_path
-        self.event_sink = event_sink
+    def __init__(
+        self,
+        notification_sink=None,
+        turn_started_sink=None,
+        notification_cancel_sink=None,
+        sock_path=DAEMON_SOCK,
+    ):
+        self.notification_sink = notification_sink
+        self.turn_started_sink = turn_started_sink
+        self.notification_cancel_sink = notification_cancel_sink
         self.sock_path = sock_path
         self.client = None
+        self.connected = False
         self.joined = set()
-        self._stop = threading.Event()
-        self._closed = threading.Event()
-        self._thread = None
-        self._join_attempts = set()
-        self._attempts_lock = threading.Lock()
-
+        self.threads = {}
+        self.approvals = {}
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.closed = threading.Event()
+        self.thread = None
+        self.joining = set()
 
     def start(self):
-        self._thread = threading.Thread(
-            target=self._run_forever,
-            name="codex-daemon-client",
-            daemon=True,
-        )
-        self._thread.start()
-        log.info("daemon client started (sock=%s)", self.sock_path)
+        self.thread = threading.Thread(target=self._run_forever, name="codex-daemon-client", daemon=True)
+        self.thread.start()
 
     def stop(self):
-        self._stop.set()
+        self.stop_event.set()
         if self.client:
             self.client.close()
 
     def _run_forever(self):
-        backoff = 2
-        while not self._stop.is_set():
-            self._closed.clear()
+        delay = 2
+        while not self.stop_event.is_set():
+            self.closed.clear()
             try:
                 self._connect_and_serve()
-                backoff = 2
-            except Exception as e:
-                log.warning("daemon connection failed: %r", e)
-            if self._stop.is_set():
-                break
-            log.info("daemon reconnect in %ss", backoff)
-            self._stop.wait(backoff)
-            backoff = min(backoff * 2, 30)
+                delay = 2
+            except Exception as exc:
+                log.warning("daemon connection failed: %s", exc)
+            if not self.stop_event.is_set():
+                self.stop_event.wait(delay)
+                delay = min(delay * 2, 30)
 
     def _connect_and_serve(self):
         client = WSClient(
@@ -130,561 +78,260 @@ class DaemonClient:
             sock_path=self.sock_path,
             on_notification=self._on_notification,
             on_server_request=self._on_server_request,
-            on_close=lambda: self._closed.set(),
+            on_close=self.closed.set,
         )
-        self.client = client
+        with self.lock:
+            self.client = client
+            self.connected = False
+            self.joined.clear()
         try:
-            r = client.request(
-                "initialize",
-                {"clientInfo": {
-                    "name": "codex-watch-bridge",
-                    "title": "Codex Watch Bridge",
-                    "version": "0.2.0",
-                }},
-                timeout=20,
-            )
+            client.request("initialize", {"clientInfo": {
+                "name": "codex-watch-bridge",
+                "title": "Codex Watch Bridge",
+                "version": "0.3.0",
+            }}, timeout=20)
             client.notify("initialized")
-            log.info("daemon connection ready")
-            try:
-                self._restore_threads()
-            except Exception as e:
-                log.warning("thread restore failed: %r", e)
-            self._closed.wait()
+            self.connected = True
+            self._restore_threads()
+            self.closed.wait()
         finally:
+            with self.lock:
+                if self.client is client:
+                    self.client = None
+                    self.connected = False
+                    self.joined.clear()
             client.close()
-            if self.client is client:
-                self.client = None
-            log.info("daemon connection closed")
-
 
     def _restore_threads(self):
-        """Join live threads after (re)connect and refresh the persisted set."""
-        now = int(time.time())
-        try:
-            r = self.client.request(
-                "thread/list",
-                {"limit": 100, "sourceKinds": ALL_SOURCE_KINDS},
-                timeout=30,
-            )
-        except Exception as e:
-            log.warning("thread/list failed: %r", e)
-            r = None
-        data = ((r or {}).get("data")) or []
-        conn = _connect_db(self.db_path)
-        try:
-            for t in data:
-                tid = t.get("id")
-                if not tid:
-                    continue
-                st = ((t.get("status") or {}).get("type")) or "unknown"
-                conn.execute(
-                    """
-                    INSERT INTO daemon_threads (
-                        thread_id, cwd, name, source, joined_at, last_active
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(thread_id) DO UPDATE SET
-                        cwd = COALESCE(excluded.cwd, daemon_threads.cwd),
-                        name = COALESCE(excluded.name, daemon_threads.name),
-                        source = COALESCE(excluded.source, daemon_threads.source),
-                        last_active = excluded.last_active
-                    """,
-                    (
-                        tid,
-                        _bindable(t.get("cwd")),
-                        _bindable(t.get("name")),
-                        _bindable(t.get("source")),
-                        now,
-                        now,
-                    ),
-                )
-                if st == "active":
-                    self._join_thread(tid)
-            rows = conn.execute(
-                """
-                SELECT thread_id FROM daemon_threads
-                ORDER BY last_active DESC LIMIT ?
-                """,
-                (REJOIN_LIMIT,),
-            ).fetchall()
-            for row in rows:
-                self._join_thread(row["thread_id"])
-            active_ids = {
-                t.get("id") for t in data
-                if ((t.get("status") or {}).get("type")) == "active"
-            }
-            pend = conn.execute(
-                "SELECT approval_id, thread_id FROM approvals WHERE status='pending'"
-            ).fetchall()
-            for p in pend:
-                if p["thread_id"] not in active_ids:
-                    conn.execute(
-                        "UPDATE approvals SET status='expired' WHERE approval_id=?",
-                        (p["approval_id"],),
-                    )
-                    log.info("approval %s expired (thread not active)", p["approval_id"])
-            conn.commit()
-        finally:
-            conn.close()
+        result = self.client.request(
+            "thread/list",
+            {"limit": 100, "sourceKinds": ALL_SOURCE_KINDS},
+            timeout=30,
+        )
+        for item in (result or {}).get("data") or []:
+            thread_id = item.get("id")
+            if thread_id:
+                self.threads[thread_id] = {
+                    "cwd": item.get("cwd") or "",
+                    "name": item.get("name") or "",
+                }
+                if (item.get("status") or {}).get("type") == "active":
+                    self._join_thread(thread_id)
+
+    def note_thread(self, thread_id, cwd=None, name=None):
+        if not thread_id:
+            return
+        self.threads[str(thread_id)] = {"cwd": cwd or "", "name": name or ""}
+        self._join_thread(str(thread_id))
 
     def _join_thread(self, thread_id):
-        """Join a thread, with rollout-wait retries, without blocking the WS reader."""
-        if not thread_id or self.client is None:
+        if not thread_id or not self.client:
             return
-        with self._attempts_lock:
-            if thread_id in self.joined or thread_id in self._join_attempts:
+        with self.lock:
+            if thread_id in self.joined or thread_id in self.joining:
                 return
-            self._join_attempts.add(thread_id)
+            self.joining.add(thread_id)
         threading.Thread(
-            target=self._join_worker, args=(thread_id,), daemon=True,
-            name="join-%s" % thread_id[:8],
+            target=self._join_worker,
+            args=(thread_id, self.client),
+            daemon=True,
         ).start()
 
-    def _join_worker(self, thread_id):
-        client = self.client
+    def _join_worker(self, thread_id, client):
         try:
             for attempt in range(8):
-                if self.client is not client or self._stop.is_set():
+                if self.client is not client or self.stop_event.is_set():
                     return
                 try:
                     client.request("thread/resume", {"threadId": thread_id}, timeout=20)
-                    self.joined.add(thread_id)
-                    now = int(time.time())
-                    conn = _connect_db(self.db_path)
-                    try:
-                        conn.execute(
-                            "UPDATE daemon_threads SET joined_at=?, last_active=? WHERE thread_id=?",
-                            (now, now, thread_id),
-                        )
-                        conn.commit()
-                    finally:
-                        conn.close()
-                    log.info("JOINED thread %s", thread_id)
+                    with self.lock:
+                        if self.client is client:
+                            self.joined.add(thread_id)
+                    log.info("joined thread %s", thread_id)
                     return
-                except Exception as e:
-                    log.info("join %s attempt %d failed: %s", thread_id[:8], attempt + 1, e)
-                    if self._stop.is_set():
-                        return
-                    time.sleep(2)
+                except Exception as exc:
+                    if attempt == 7:
+                        log.warning("thread resume failed %s: %s", thread_id, exc)
+                    self.stop_event.wait(2)
         finally:
-            with self._attempts_lock:
-                self._join_attempts.discard(thread_id)
-
-    def _drop_thread(self, thread_id):
-        if not thread_id:
-            return
-        self.joined.discard(thread_id)
-        conn = _connect_db(self.db_path)
-        try:
-            conn.execute("DELETE FROM daemon_threads WHERE thread_id=?", (thread_id,))
-            conn.commit()
-        finally:
-            conn.close()
-
-    def note_thread(self, thread_id, cwd=None, name=None):
-        """Learn a thread out-of-band (codex_notify carries its id) and join it
-        by explicit id. thread/list + connect-time status dump only cover
-        threads fully resolved in the daemon index; a session pinned to a custom
-        model provider is dropped there, so its status is never broadcast and
-        the bridge would never join it. thread/resume by id only needs the
-        provider and succeeds when not mid-turn. Upsert persists the id so a
-        reconnect rejoins it via the DB top-N path."""
-        if not thread_id:
-            return
-        now = int(time.time())
-        conn = _connect_db(self.db_path)
-        try:
-            conn.execute(
-                """
-                INSERT INTO daemon_threads (
-                    thread_id, cwd, name, source, joined_at, last_active
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(thread_id) DO UPDATE SET
-                    cwd = COALESCE(excluded.cwd, daemon_threads.cwd),
-                    name = COALESCE(excluded.name, daemon_threads.name),
-                    last_active = excluded.last_active
-                """,
-                (thread_id, _bindable(cwd), _bindable(name), "notified", now, now),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        log.info("note_thread: %s cwd=%s", thread_id, cwd)
-        self._join_thread(thread_id)
-
+            with self.lock:
+                self.joining.discard(thread_id)
 
     def _on_notification(self, method, params, msg):
         params = params or {}
-        if method == "thread/status/changed":
-            st = params.get("status") or {}
-            if st.get("type") == "active":
-                self._join_thread(params.get("threadId"))
-        elif method == "thread/started":
-            th = params.get("thread") or {}
-            self._join_thread(th.get("id"))
+        thread_id = params.get("threadId")
+        if method == "thread/started":
+            thread = params.get("thread") or {}
+            thread_id = thread.get("id")
+            self.note_thread(thread_id, cwd=thread.get("cwd"))
+        elif method == "thread/status/changed":
+            if (params.get("status") or {}).get("type") == "active":
+                self._join_thread(thread_id)
         elif method == "thread/deleted":
-            self._drop_thread(params.get("threadId"))
-        elif method == "serverRequest/resolved":
-            self._mark_resolved(params.get("threadId"), params.get("requestId"))
+            self.threads.pop(thread_id, None)
+            with self.lock:
+                self.joined.discard(thread_id)
+        elif method == "turn/started":
+            turn = params.get("turn") or {}
+            if self.turn_started_sink:
+                self.turn_started_sink(thread_id)
+            self._cancel_thread_approvals(thread_id)
         elif method == "turn/completed":
             turn = params.get("turn") or {}
-            self._expire_turn(params.get("threadId"), turn.get("id"))
+            self._expire_turn(thread_id, turn.get("id"))
+        elif method == "serverRequest/resolved":
+            self._mark_resolved(thread_id, params.get("requestId"))
 
     def _on_server_request(self, method, params, msg):
         if method not in APPROVAL_METHODS:
-            log.warning("unhandled server request %s id=%s", method, msg.get("id"))
-            self.client.respond(msg.get("id"), {"decision": "cancel"})
+            log.warning("unsupported server request %s", method)
+            client = self.client
+            if client:
+                client.respond(msg.get("id"), {"decision": "cancel"})
             return
-        threading.Thread(
-            target=self._store_approval,
-            args=(method, params or {}, msg),
-            daemon=True,
-            name="store-approval",
-        ).start()
-
-
-    def _store_approval(self, method, p, msg):
         request_id = msg.get("id")
-        thread_id = p.get("threadId")
-        turn_id = p.get("turnId")
-        kind = p.get("kind") or method
-        command = p.get("command") or ""
-        cwd = p.get("cwd") or ""
-        reason = p.get("reason") or ""
-        available = p.get("availableDecisions")
+        thread_id = (params or {}).get("threadId")
         approval_id = uuid.uuid4().hex[:16]
-        now = int(time.time())
-
-        conn = _connect_db(self.db_path)
-        try:
-            conn.execute(
-                """
-                INSERT INTO approvals (
-                    approval_id, request_id, thread_id, turn_id, item_id,
-                    method, kind, command, cwd, reason, available_decisions,
-                    status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-                ON CONFLICT(thread_id, request_id) DO UPDATE SET
-                    approval_id = excluded.approval_id,
-                    status = 'pending',
-                    decision = NULL,
-                    decided_at = NULL,
-                    decided_by = NULL,
-                    command = excluded.command,
-                    reason = excluded.reason,
-                    created_at = excluded.created_at
-                """,
-                (
-                    approval_id,
-                    request_id,
-                    thread_id,
-                    turn_id,
-                    p.get("itemId"),
-                    method,
-                    kind,
-                    command,
-                    cwd,
-                    reason,
-                    json.dumps(available, ensure_ascii=False) if available is not None else None,
-                    now,
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        log.info(
-            "APPROVAL pending id=%s thread=%s kind=%s cmd=%s",
-            approval_id, thread_id, kind, (command or "")[:120],
-        )
-
-        _timer = threading.Timer(
+        entry = {
+            "approval_id": approval_id,
+            "request_id": request_id,
+            "thread_id": thread_id,
+            "turn_id": (params or {}).get("turnId"),
+            "item_id": (params or {}).get("itemId"),
+            "method": method,
+            "kind": (params or {}).get("kind") or method,
+            "command": (params or {}).get("command") or "",
+            "cwd": (params or {}).get("cwd") or "",
+            "reason": (params or {}).get("reason") or "",
+            "available_decisions": (params or {}).get("availableDecisions"),
+            "status": "pending",
+            "created_at": int(time.time()),
+            "timer": None,
+        }
+        timer = threading.Timer(
             APPROVAL_PUSH_DELAY,
-            self._delayed_push,
-            args=(approval_id, thread_id, turn_id, kind, command, cwd, reason, available, method),
+            self._publish_approval,
+            args=(approval_id,),
         )
-        _timer.daemon = True
-        _timer.start()
-    def _delayed_push(self, approval_id, thread_id, turn_id, kind, command, cwd, reason, available, method):
-        """Push approval to watch only if still pending (user hasn't responded in terminal)."""
-        if not self.event_sink:
-            return
-        conn = _connect_db(self.db_path)
-        try:
-            row = conn.execute(
-                "SELECT status FROM approvals WHERE approval_id=?", (approval_id,)
-            ).fetchone()
-        finally:
-            conn.close()
-        if not row or row["status"] != "pending":
-            log.info("approval %s no longer pending (status=%s), skip push",
-                     approval_id, row["status"] if row else "missing")
-            return
-        project = os.path.basename(cwd) if cwd else "codex"
-        body = (command or reason or method).strip().replace("\n", " ")
-        if len(body) > 160:
-            body = body[:157] + "..."
-        now = int(time.time())
-        try:
-            self.event_sink({
+        timer.daemon = True
+        entry["timer"] = timer
+        with self.lock:
+            if any(
+                item["thread_id"] == thread_id
+                and str(item["request_id"]) == str(request_id)
+                and item["status"] in ("pending", "sent")
+                for item in self.approvals.values()
+            ):
+                return
+            self.approvals[approval_id] = entry
+        self.note_thread(thread_id, cwd=entry["cwd"])
+        timer.start()
+
+    def _publish_approval(self, approval_id):
+        with self.lock:
+            entry = self.approvals.get(approval_id)
+            if not entry or entry["status"] != "pending":
+                return
+            item = {
                 "event_id": "appr-" + approval_id,
-                "source": "daemon-client",
-                "machine_id": MACHINE_ID,
-                "session_id": thread_id,
                 "type": "approval_request",
                 "title": "APPROVAL NEEDED",
-                "body": f"{project}: {body}",
-                "payload": {
-                    "approval_id": approval_id,
-                    "thread_id": thread_id,
-                    "turn_id": turn_id,
-                    "kind": kind,
-                    "command": command,
-                    "cwd": cwd,
-                    "reason": reason,
-                    "available_decisions": available,
-                },
-                "created_at": now,
-                "expires_at": now + EVENT_TTL,
-            })
-            log.info("approval %s pushed to watch (still pending after %ds)", approval_id, APPROVAL_PUSH_DELAY)
-        except Exception as e:
-            log.warning("approval delayed push failed: %r", e)
+                "body": entry["command"] or entry["reason"] or entry["kind"],
+                "payload": {key: value for key, value in entry.items()
+                            if key not in ("timer", "status", "created_at", "request_id")},
+                "created_at": entry["created_at"],
+            }
+            if self.notification_sink:
+                self.notification_sink(item)
+
+    def _cancel_thread_approvals(self, thread_id):
+        with self.lock:
+            ids = [
+                key for key, item in self.approvals.items()
+                if item["thread_id"] == thread_id and item["status"] == "pending"
+            ]
+        for approval_id in ids:
+            self._resolve_approval(approval_id, "resolved", "tui")
 
     def _mark_resolved(self, thread_id, request_id):
-        """serverRequest/resolved: someone (terminal or watch) answered."""
-        if thread_id is None and request_id is None:
-            return
-        conn = _connect_db(self.db_path)
-        try:
-            cur = conn.execute(
-                """
-                UPDATE approvals
-                SET status='resolved',
-                    decided_at=COALESCE(decided_at, ?),
-                    decided_by=COALESCE(decided_by, 'external')
-                WHERE thread_id=? AND request_id=? AND status IN ('pending','sent')
-                """,
-                (int(time.time()), thread_id, request_id),
-            )
-            conn.commit()
-            if cur.rowcount:
-                log.info("APPROVAL resolved thread=%s request_id=%s", thread_id, request_id)
-            try:
-                row = conn.execute(
-                    "SELECT turn_id FROM approvals WHERE thread_id=? AND request_id=?",
-                    (thread_id, request_id),
-                ).fetchone()
-                if row is not None and row["turn_id"]:
-                    cur2 = conn.execute(
-                        """
-                        UPDATE approvals
-                        SET status='resolved',
-                            decided_at=COALESCE(decided_at, ?),
-                            decided_by=COALESCE(decided_by, 'external')
-                        WHERE thread_id=? AND turn_id=?
-                          AND request_id LIKE 'notify:%'
-                          AND status IN ('pending','sent')
-                        """,
-                        (int(time.time()), thread_id, row["turn_id"]),
-                    )
-                    conn.commit()
-                    if cur2.rowcount:
-                        log.info("APPROVAL resolved notify twin thread=%s turn=%s (count=%d)",
-                                 thread_id, row["turn_id"], cur2.rowcount)
-            except Exception as exc:
-                log.warning("notify twin resolve failed: %r", exc)
-        finally:
-            conn.close()
+        with self.lock:
+            ids = [
+                key for key, item in self.approvals.items()
+                if item["thread_id"] == thread_id
+                and str(item["request_id"]) == str(request_id)
+            ]
+        for approval_id in ids:
+            self._resolve_approval(approval_id, "resolved", "external")
 
     def _expire_turn(self, thread_id, turn_id):
-        """Turn finished: any still-pending approval of that turn is gone."""
-        if not thread_id:
-            return
-        conn = _connect_db(self.db_path)
-        try:
-            if turn_id:
-                conn.execute(
-                    "UPDATE approvals SET status='expired' WHERE thread_id=? AND turn_id=? AND status IN ('pending','sent')",
-                    (thread_id, turn_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE approvals SET status='expired' WHERE thread_id=? AND status IN ('pending','sent')",
-                    (thread_id,),
-                )
-            conn.commit()
-        finally:
-            conn.close()
+        with self.lock:
+            ids = [
+                key for key, item in self.approvals.items()
+                if item["thread_id"] == thread_id
+                and (not turn_id or item["turn_id"] == turn_id)
+                and item["status"] == "pending"
+            ]
+        for approval_id in ids:
+            self._resolve_approval(approval_id, "expired", "turn-complete")
 
+    def _resolve_approval(self, approval_id, status, decided_by):
+        with self.lock:
+            item = self.approvals.get(approval_id)
+            if not item or item["status"] not in ("pending", "sent"):
+                return
+            item["status"] = status
+            item["decided_by"] = decided_by
+            item["timer"].cancel()
+        if self.notification_cancel_sink:
+            self.notification_cancel_sink(approval_id)
+
+    def list_approvals(self, status="pending"):
+        with self.lock:
+            items = [
+                {key: value for key, value in item.items() if key != "timer"}
+                for item in self.approvals.values()
+                if status == "all" or item["status"] == status
+            ]
+        return sorted(items, key=lambda item: item["created_at"], reverse=True)[:50]
 
     def handle_decision(self, approval_id, decision):
-        """Send the watch's decision to the daemon. Returns a dict for HTTP."""
         if decision not in VALID_DECISIONS:
-            return {"ok": False, "error": "decision must be one of %s" % "|".join(VALID_DECISIONS)}
+            return {"ok": False, "error": "invalid decision"}
+        with self.lock:
+            item = self.approvals.get(approval_id)
+            client = self.client
+            if not item:
+                return {"ok": False, "error": "approval not found"}
+            if item["status"] != "pending":
+                return {"ok": False, "error": "approval already " + item["status"]}
+            if not client or client.closed:
+                return {"ok": False, "error": "not connected to codex daemon"}
+            item["status"] = "sending"
+        try:
+            client.respond(item["request_id"], {"decision": decision})
+        except Exception as exc:
+            with self.lock:
+                item["status"] = "pending"
+            return {"ok": False, "error": str(exc)}
+        with self.lock:
+            item["status"] = "sent"
+            item["decision"] = decision
+            item["decided_by"] = "watch"
+            item["decided_at"] = int(time.time())
+            item["timer"].cancel()
+        return {"ok": True, "approval_id": approval_id, "decision": decision, "status": "sent"}
+
+    def send_turn(self, thread_id, text):
         client = self.client
-        if client is None or client.closed:
+        if not client or client.closed:
             return {"ok": False, "error": "not connected to codex daemon"}
-
-        conn = _connect_db(self.db_path)
+        if thread_id not in self.joined:
+            return {"ok": False, "error": "thread is not joined"}
         try:
-            row = conn.execute(
-                "SELECT * FROM approvals WHERE approval_id=?", (approval_id,)
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is None:
-            return {"ok": False, "error": "approval not found"}
-        if row["status"] not in ("pending", "sent"):
-            return {"ok": False, "error": "approval already %s" % row["status"]}
-
-        notify_row = str(row["request_id"]).startswith("notify:")
-        respond_row = row
-        sibling_id = None
-        if notify_row:
-            conn = _connect_db(self.db_path)
-            try:
-                if row["turn_id"]:
-                    sib = conn.execute(
-                        """
-                        SELECT * FROM approvals
-                        WHERE thread_id=? AND turn_id=?
-                          AND request_id NOT LIKE 'notify:%'
-                          AND status IN ('pending','sent')
-                          AND command = ?
-                        ORDER BY created_at DESC LIMIT 1
-                        """,
-                        (row["thread_id"], row["turn_id"], row["command"]),
-                    ).fetchone()
-                    if sib is None:
-                        sib = conn.execute(
-                            """
-                            SELECT * FROM approvals
-                            WHERE thread_id=? AND turn_id=?
-                              AND request_id NOT LIKE 'notify:%'
-                              AND status IN ('pending','sent')
-                            ORDER BY created_at DESC LIMIT 1
-                            """,
-                            (row["thread_id"], row["turn_id"]),
-                        ).fetchone()
-                else:
-                    sib = conn.execute(
-                        """
-                        SELECT * FROM approvals
-                        WHERE thread_id=?
-                          AND request_id NOT LIKE 'notify:%'
-                          AND status IN ('pending','sent')
-                        ORDER BY created_at DESC LIMIT 1
-                        """,
-                        (row["thread_id"],),
-                    ).fetchone()
-            finally:
-                conn.close()
-            if sib is None:
-                done = None
-                conn = _connect_db(self.db_path)
-                try:
-                    if row["turn_id"]:
-                        done = conn.execute(
-                            """
-                            SELECT * FROM approvals
-                            WHERE thread_id=? AND turn_id=?
-                              AND request_id NOT LIKE 'notify:%'
-                              AND status IN ('resolved','expired')
-                              AND command = ?
-                            ORDER BY decided_at DESC, created_at DESC LIMIT 1
-                            """,
-                            (row["thread_id"], row["turn_id"], row["command"]),
-                        ).fetchone()
-                        if done is None:
-                            done = conn.execute(
-                                """
-                                SELECT * FROM approvals
-                                WHERE thread_id=? AND turn_id=?
-                                  AND request_id NOT LIKE 'notify:%'
-                                  AND status IN ('resolved','expired')
-                                ORDER BY decided_at DESC, created_at DESC LIMIT 1
-                                """,
-                                (row["thread_id"], row["turn_id"]),
-                            ).fetchone()
-                    if done is None:
-                        done = conn.execute(
-                            """
-                            SELECT * FROM approvals
-                            WHERE thread_id=?
-                              AND request_id NOT LIKE 'notify:%'
-                              AND status IN ('resolved','expired')
-                            ORDER BY decided_at DESC, created_at DESC LIMIT 1
-                            """,
-                            (row["thread_id"],),
-                        ).fetchone()
-                    if done is not None:
-                        conn.execute(
-                            """
-                            UPDATE approvals
-                            SET status='resolved',
-                                decided_at=COALESCE(decided_at, ?),
-                                decided_by=COALESCE(decided_by, 'terminal')
-                            WHERE approval_id=?
-                            """,
-                            (int(time.time()), row["approval_id"]),
-                        )
-                        conn.commit()
-                finally:
-                    conn.close()
-                if done is not None:
-                    log.info("DECISION id=%s already handled (daemon sibling %s)",
-                             approval_id, done["approval_id"])
-                    return {
-                        "ok": False,
-                        "error": "already handled in Codex terminal",
-                    }
-                return {
-                    "ok": False,
-                    "error": "no active daemon approval to answer; approve in Codex terminal",
-                }
-            respond_row = sib
-            sibling_id = row["approval_id"]
-
-        try:
-            rid = respond_row["request_id"]
-            try:
-                rid = int(rid)
-            except (TypeError, ValueError):
-                return {"ok": False, "error": "approval has no valid daemon request id; approve in Codex terminal"}
-            client.respond(rid, {"decision": decision})
-        except Exception as e:
-            log.warning("respond failed for %s: %r", approval_id, e)
-            return {"ok": False, "error": "failed to send decision to daemon"}
-
-        now = int(time.time())
-        conn = _connect_db(self.db_path)
-        try:
-            conn.execute(
-                """
-                UPDATE approvals
-                SET status='sent', decision=?, decided_at=?, decided_by='watch'
-                WHERE approval_id=?
-                """,
-                (decision, now, respond_row["approval_id"]),
-            )
-            if sibling_id:
-                conn.execute(
-                    """
-                    UPDATE approvals
-                    SET status='sent', decision=?, decided_at=?, decided_by='watch'
-                    WHERE approval_id=?
-                    """,
-                    (decision, now, sibling_id),
-                )
-            conn.commit()
-        finally:
-            conn.close()
-        log.info("DECISION sent id=%s (daemon=%s) decision=%s", approval_id, respond_row["approval_id"], decision)
-        return {
-            "ok": True,
-            "approval_id": approval_id,
-            "decision": decision,
-            "status": "sent",
-        }
-
-
-INSTANCE = None
+            result = client.request("turn/start", {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": text}],
+            }, timeout=30)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "thread_id": thread_id, "turn": result.get("turn") if isinstance(result, dict) else None}
