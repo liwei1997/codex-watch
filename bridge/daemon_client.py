@@ -216,6 +216,13 @@ class DaemonClient:
         timer.daemon = True
         entry["timer"] = timer
         with self.lock:
+            if any(
+                item["thread_id"] == thread_id
+                and str(item["request_id"]) == str(request_id)
+                and item["status"] in ("pending", "sent")
+                for item in self.approvals.values()
+            ):
+                return
             self.approvals[approval_id] = entry
         self.note_thread(thread_id, cwd=entry["cwd"])
         timer.start()
@@ -234,8 +241,8 @@ class DaemonClient:
                             if key not in ("timer", "status", "created_at", "request_id")},
                 "created_at": entry["created_at"],
             }
-        if self.notification_sink:
-            self.notification_sink(item)
+            if self.notification_sink:
+                self.notification_sink(item)
 
     def _cancel_thread_approvals(self, thread_id):
         with self.lock:

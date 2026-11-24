@@ -77,8 +77,7 @@ def _publish_completion(thread_id, turn_id):
         if not pending or pending["turn_id"] != turn_id:
             return
         pending_completions.pop(thread_id, None)
-        item = pending["notification"]
-    queue_notification(item)
+        queue_notification(pending["notification"])
 
 
 def schedule_completion(data):
