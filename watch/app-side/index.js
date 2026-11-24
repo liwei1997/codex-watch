@@ -16,7 +16,7 @@ const DEFAULT_CONSUMER_ID = 'iphone'
 
 // Bump this on every app-side change; the watch home page probes it via
 // bridge.version and shows the generation actually running on the phone.
-const SIDE_JS_MARK = '117-20261120'
+const SIDE_JS_MARK = '112-20261124'
 const REQUEST_TIMEOUT = 10000
 
 // ========================================
@@ -358,14 +358,14 @@ AppSideService(
         // ==================================
 
         console.log(
-          '[Codex Watch] Unknown 20261120 method: ' + method
+          '[Codex Watch] Unknown method: ' + method
         )
         console.log(
           '[Codex Watch] Unknown request: ' +
           JSON.stringify(req)
         )
 
-        res('Unknown 20261120 method: ' + method)
+        res('Unknown method: ' + method)
 
       } catch (error) {
 
