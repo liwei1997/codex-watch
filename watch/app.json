@@ -1,12 +1,12 @@
 {
   "configVersion": "v3",
   "app": {
-    "appId": 28869,
+    "appId": 73521,
     "appName": "Codex Watch",
     "appType": "app",
     "version": {
-      "code": 18,
-      "name": "1.1.15"
+      "code": 19,
+      "name": "1.1.16"
     },
     "icon": "icon.png",
     "vender": "zepp",
