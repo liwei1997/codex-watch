@@ -490,6 +490,33 @@ class DaemonClient:
             conn.commit()
             if cur.rowcount:
                 log.info("APPROVAL resolved thread=%s request_id=%s", thread_id, request_id)
+            # Plan A: a daemon resolution also retires the notify-hook twin row
+            # for the same turn, so a request answered in the terminal/TUI is
+            # never pushed to the watch.
+            try:
+                row = conn.execute(
+                    "SELECT turn_id FROM approvals WHERE thread_id=? AND request_id=?",
+                    (thread_id, request_id),
+                ).fetchone()
+                if row is not None and row["turn_id"]:
+                    cur2 = conn.execute(
+                        """
+                        UPDATE approvals
+                        SET status='resolved',
+                            decided_at=COALESCE(decided_at, ?),
+                            decided_by=COALESCE(decided_by, 'external')
+                        WHERE thread_id=? AND turn_id=?
+                          AND request_id LIKE 'notify:%'
+                          AND status IN ('pending','sent')
+                        """,
+                        (int(time.time()), thread_id, row["turn_id"]),
+                    )
+                    conn.commit()
+                    if cur2.rowcount:
+                        log.info("APPROVAL resolved notify twin thread=%s turn=%s (count=%d)",
+                                 thread_id, row["turn_id"], cur2.rowcount)
+            except Exception as exc:
+                log.warning("notify twin resolve failed: %r", exc)
         finally:
             conn.close()
 
@@ -582,6 +609,69 @@ class DaemonClient:
             finally:
                 conn.close()
             if sib is None:
+                # No live daemon sibling: the approval may already have been
+                # answered in the terminal (or the turn ended) while this
+                # notify row was left pending. Look for a resolved/expired
+                # sibling and retire this stale row so the watch can dismiss
+                # the card ("already handled") instead of failing.
+                done = None
+                conn = _connect_db(self.db_path)
+                try:
+                    if row["turn_id"]:
+                        done = conn.execute(
+                            """
+                            SELECT * FROM approvals
+                            WHERE thread_id=? AND turn_id=?
+                              AND request_id NOT LIKE 'notify:%'
+                              AND status IN ('resolved','expired')
+                              AND command = ?
+                            ORDER BY decided_at DESC, created_at DESC LIMIT 1
+                            """,
+                            (row["thread_id"], row["turn_id"], row["command"]),
+                        ).fetchone()
+                        if done is None:
+                            done = conn.execute(
+                                """
+                                SELECT * FROM approvals
+                                WHERE thread_id=? AND turn_id=?
+                                  AND request_id NOT LIKE 'notify:%'
+                                  AND status IN ('resolved','expired')
+                                ORDER BY decided_at DESC, created_at DESC LIMIT 1
+                                """,
+                                (row["thread_id"], row["turn_id"]),
+                            ).fetchone()
+                    if done is None:
+                        done = conn.execute(
+                            """
+                            SELECT * FROM approvals
+                            WHERE thread_id=?
+                              AND request_id NOT LIKE 'notify:%'
+                              AND status IN ('resolved','expired')
+                            ORDER BY decided_at DESC, created_at DESC LIMIT 1
+                            """,
+                            (row["thread_id"],),
+                        ).fetchone()
+                    if done is not None:
+                        conn.execute(
+                            """
+                            UPDATE approvals
+                            SET status='resolved',
+                                decided_at=COALESCE(decided_at, ?),
+                                decided_by=COALESCE(decided_by, 'terminal')
+                            WHERE approval_id=?
+                            """,
+                            (int(time.time()), row["approval_id"]),
+                        )
+                        conn.commit()
+                finally:
+                    conn.close()
+                if done is not None:
+                    log.info("DECISION id=%s already handled (daemon sibling %s)",
+                             approval_id, done["approval_id"])
+                    return {
+                        "ok": False,
+                        "error": "already handled in Codex terminal",
+                    }
                 return {
                     "ok": False,
                     "error": "no active daemon approval to answer; approve in Codex terminal",

@@ -140,6 +140,7 @@ def main():
         "command": command,
         "cwd": cwd,
         "reason": reason,
+        "transcript_path": payload.get("transcript_path"),
     }).encode("utf-8")
 
     req = Request(
