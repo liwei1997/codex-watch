@@ -149,6 +149,25 @@ Page(
     },
 
     // ----------------------------------------------------------
+    // Text updates
+    // ----------------------------------------------------------
+
+    setWidgetText(textWidget, text, color) {
+      try {
+        if (color === undefined) {
+          textWidget.setProperty(prop.MORE, { text: text })
+        } else {
+          textWidget.setProperty(
+            prop.MORE, { text: text, color: color }
+          )
+        }
+      } catch (error) {
+        textWidget.text = text
+        textWidget.color = color
+      }
+    },
+
+    // ----------------------------------------------------------
     // List rendering
     // ----------------------------------------------------------
 
@@ -263,9 +282,9 @@ Page(
 
       // Recent (resolved/expired)
       if (this.recent.length === 0) {
-        this.recentText.text = 'No recent decisions.'
+        this.setWidgetText(this.recentText, 'No recent decisions.')
       } else {
-        this.recentText.text = this.recent
+        this.setWidgetText(this.recentText, this.recent
           .map((a) => {
             const label =
               a.status === 'expired'
@@ -280,6 +299,7 @@ Page(
             )
           })
           .join('\n')
+        )
       }
 
       if (this.actionable.length === 0) {
@@ -340,9 +360,10 @@ Page(
       )
 
       const approveItem = {
+        key: 'accept',
         button: addButton(
           'APPROVE', 70, 288, 105, 52,
-          () => approval.actionable !== false && self.decisionAction('accept'),
+          () => self.decisionAction('accept'),
           {
             normalColor: COLORS.green,
             pressColor: COLORS.greenPress,
@@ -354,9 +375,10 @@ Page(
       }
 
       const rejectItem = {
+        key: 'decline',
         button: addButton(
           'REJECT', 188, 288, 105, 52,
-          () => approval.actionable !== false && self.decisionAction('decline'),
+          () => self.decisionAction('decline'),
           {
             normalColor: COLORS.red,
             pressColor: COLORS.redPress,
@@ -368,6 +390,7 @@ Page(
       }
 
       const cancelItem = {
+        key: 'cancel',
         button: addButton(
           'CANCEL', 306, 288, 105, 52,
           () => self.overlay && self.overlay.close(),
@@ -404,8 +427,7 @@ Page(
       }
 
       overlay.setStatus = (text, color) => {
-        status.text = text
-        status.color = color
+        self.setWidgetText(status, text, color)
       }
 
       overlay.close = () => {
@@ -437,10 +459,19 @@ Page(
 
           try {
             deleteWidget(b.button)
+            console.log(TAG + ' Overlay button deleted')
           } catch (error) {
-            // ignore
+            console.log(TAG + ' Overlay button delete failed: ' + String(error))
+            try {
+              b.button.setProperty(
+                prop.MORE, { x: px(-1000), y: px(-1000) }
+              )
+              b.button.setProperty(prop.MORE, { text: '' })
+              b.button.setEnable(false)
+            } catch (fallbackError) {
+              console.log(TAG + ' Overlay button hide failed: ' + String(fallbackError))
+            }
           }
-
           try {
             deleteWidget(b.focusFrame)
           } catch (error) {
@@ -473,9 +504,10 @@ Page(
         }
 
         if (action === 'select') {
-          if (overlay.selected === 0) {
+          const key = buttons[overlay.selected] && buttons[overlay.selected].key
+          if (key === 'accept') {
             self.decisionAction('accept')
-          } else if (overlay.selected === 1) {
+          } else if (key === 'decline') {
             self.decisionAction('decline')
           } else {
             overlay.close()
@@ -510,7 +542,13 @@ Page(
     decisionAction(decision) {
       const overlay = this.overlay
 
-      if (!overlay || overlay.busy) {
+      console.log(TAG + ' decisionAction ' + decision + (overlay ? ' for ' + overlay.approval.approval_id : ' (no overlay)'))
+
+      if (!overlay) {
+        return
+      }
+      if (overlay.busy) {
+        overlay.setStatus('BUSY — WAITING FOR SERVER', COLORS.orangeText)
         return
       }
       if (overlay.approval.actionable === false) {
@@ -527,6 +565,11 @@ Page(
 
     async sendDecision(overlay, decision) {
       const approval = overlay.approval
+      const startedAt = Date.now()
+
+      console.log(
+        TAG + ' sendDecision start ' + decision + ' ' + approval.approval_id
+      )
 
       try {
         const result = await this.request(
@@ -538,6 +581,12 @@ Page(
             }
           },
           { timeout: REQUEST_TIMEOUT }
+        )
+
+        console.log(
+          TAG + ' sendDecision result ' +
+          (result && result.ok === true ? 'ok' : 'not-ok') +
+          ' after ' + (Date.now() - startedAt) + 'ms'
         )
 
         if (this.destroyed) {
@@ -584,6 +633,12 @@ Page(
         }
 
       } catch (error) {
+        console.log(
+          TAG + ' sendDecision failed after ' +
+          (Date.now() - startedAt) + 'ms: ' +
+          String(error && error.message ? error.message : error)
+        )
+
         if (this.destroyed) {
           return
         }
@@ -658,9 +713,16 @@ Page(
           throw new Error('Invalid response from phone')
         }
 
-        this.all = Array.isArray(result.approvals)
+        this.all = (Array.isArray(result.approvals)
           ? result.approvals
           : []
+        ).map((a) => {
+          if (a && a.status === 'pending' &&
+              String(a.approval_id || '') !== '') {
+            a.actionable = true
+          }
+          return a
+        })
 
         this.actionable = this.all.filter(
           (a) => a.status === 'pending'
@@ -702,9 +764,11 @@ Page(
 
       } catch (error) {
         if (!this.destroyed) {
-          this.status.text =
-            'CONNECTION FAILED · ' + shortError(error, 18)
-          this.status.color = COLORS.redText
+          this.setWidgetText(
+            this.status,
+            'CONNECTION FAILED · ' + shortError(error, 18),
+            COLORS.redText
+          )
           this.scheduleFastRetry()
         }
         console.log(
@@ -838,6 +902,25 @@ Page(
         this.overlay.widgets.forEach((w) => {
           try {
             deleteWidget(w)
+          } catch (error) {
+            // ignore
+          }
+        })
+
+        this.overlay.buttons.forEach((item) => {
+          const b = item.button
+
+          if (!b) {
+            return
+          }
+
+          try {
+            deleteWidget(b.button)
+          } catch (error) {
+            // ignore
+          }
+          try {
+            deleteWidget(b.focusFrame)
           } catch (error) {
             // ignore
           }

@@ -81,15 +81,15 @@ const CARDS = [
 // Background App Service
 // ============================================================
 
-let backgroundStartRequested = false
+let backgroundStartInFlight = false
 
 function launchBackgroundService() {
-  if (backgroundStartRequested) {
-    console.log(TAG + ' Background start already requested')
+  if (backgroundStartInFlight) {
+    console.log(TAG + ' Background start already in flight')
     return
   }
 
-  backgroundStartRequested = true
+  backgroundStartInFlight = true
 
   try {
     const result = start({
@@ -102,8 +102,9 @@ function launchBackgroundService() {
           JSON.stringify(status)
         )
 
+        backgroundStartInFlight = false
+
         if (!status || status.result !== true) {
-          backgroundStartRequested = false
           console.log(TAG + ' Background start failed')
         } else {
           console.log(TAG + ' Background service running')
@@ -114,10 +115,10 @@ function launchBackgroundService() {
     console.log(TAG + ' Background start return: ' + result)
 
     if (result !== 0) {
-      backgroundStartRequested = false
+      backgroundStartInFlight = false
     }
   } catch (error) {
-    backgroundStartRequested = false
+    backgroundStartInFlight = false
     console.log(TAG + ' Background exception: ' + String(error))
   }
 }
@@ -383,9 +384,10 @@ Page(BasePage({
   },
 
   // Probe which generation of app-side JS the phone is actually running.
-  // Returns a short label: 'JS <marker>' when the phone side answers with
-  // its build marker, 'JS 115' when it answers with the 1.1.5 unknown-method
-  // marker, 'JS OLD' for anything older.
+  // Primary path: bridge.version returns the build marker (SIDE_JS_MARK).
+  // Fallback labels when that call fails: 'JS NOVER' when the phone side
+  // answers but has no version method (older JS generation), 'JS DOWN'
+  // when the side service is unreachable.
   probePhoneJs() {
     return this.request(
       { method: 'bridge.version', params: {} },
@@ -400,10 +402,10 @@ Page(BasePage({
         const msg =
           error && error.message ? error.message : String(error)
         console.log(TAG + ' Phone side probe failed: ' + msg)
-        if (msg.indexOf('Unknown 20261120') >= 0) {
-          return 'JS 115'
+        if (msg.indexOf('Unknown method') >= 0) {
+          return 'JS NOVER'
         }
-        return 'JS OLD'
+        return 'JS DOWN'
       }
     )
   },
@@ -424,6 +426,19 @@ Page(BasePage({
     this.lastLoadAt = now
 
     const jsProbe = this.probePhoneJs()
+
+    // The JS generation probe is the fastest of the three
+    // requests. While the rest of the dashboard is still
+    // syncing, surface its result in the status row so the
+    // installed phone-side JS is visible at a glance on open.
+    jsProbe.then((label) => {
+      if (this.destroyed || !this.linkStatus) {
+        return
+      }
+      if (this.linkStatus.text.indexOf('SYNCING') === 0) {
+        this.setLinkStatus('SYNCING... · ' + label, COLORS.muted)
+      }
+    })
 
     // The two requests are independent: in v1.1.0 a single
     // failed/slow endpoint (e.g. the side service still

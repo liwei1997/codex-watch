@@ -24,6 +24,7 @@ import uuid
 import time
 import hmac
 import sqlite3
+import threading
 import logging
 
 from pathlib import Path
@@ -148,6 +149,13 @@ def init_db():
         );
     """)
 
+    # Plan A: notify-hook approvals carry the Codex transcript path so the
+    # bridge can watch it for an in-TUI answer and drop the pending push.
+    try:
+        conn.execute("ALTER TABLE approvals ADD COLUMN transcript_path TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already present
+
     # Legacy completion events had no expiry and could flood a watch after a
     # long disconnect. Keep the records, but retire that existing backlog.
     conn.execute("""
@@ -255,6 +263,9 @@ def store_event(data):
 # Out-of-band approvals (Codex notify hook)
 # --------------------------------------------------
 
+NOTIFY_PUSH_DELAY = 60
+
+
 def store_notify_approval(data):
     """Store a PENDING approval reported by the Codex notify hook
     (approval-requested). The hook does not see the app-server request,
@@ -270,6 +281,7 @@ def store_notify_approval(data):
     cwd = str(data.get("cwd") or "").strip()
     reason = str(data.get("reason") or "").strip()
     available = data.get("available_decisions")
+    transcript_path = str(data.get("transcript_path") or "").strip()
 
     import hashlib
 
@@ -286,13 +298,13 @@ def store_notify_approval(data):
 
     conn = connect_db()
     try:
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO approvals (
                 approval_id, request_id, thread_id, turn_id, item_id,
                 method, kind, command, cwd, reason, available_decisions,
-                status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                transcript_path, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             ON CONFLICT(thread_id, request_id) DO NOTHING
             """,
             (
@@ -308,19 +320,199 @@ def store_notify_approval(data):
                 reason,
                 json.dumps(available, ensure_ascii=False)
                 if available is not None else None,
+                transcript_path,
                 now,
             ),
         )
         conn.commit()
+        fresh = cur.rowcount > 0
     finally:
         conn.close()
 
-    # /v1/events only surfaces approval_request events that have a matching
-    # PENDING approvals row, so create the event with the linked id.
+    log.info(
+        "NOTIFY-APPROVAL pending id=%s thread=%s kind=%s cmd=%s (fresh=%s)",
+        approval_id, thread_id, kind, (command or "")[:120], fresh,
+    )
+
+    # Join the thread so the daemon replays the still-pending approval
+    # server-request to us. Without this, no daemon sibling row is ever
+    # created and watch decisions fail with 409.
+    try:
+        if daemon_client.INSTANCE is not None and thread_id:
+            daemon_client.INSTANCE.note_thread(thread_id, cwd=cwd)
+    except Exception as exc:
+        log.warning("note_thread in store_notify_approval failed: %r", exc)
+
+    # Delay the push: only notify the watch if the approval is still pending
+    # after NOTIFY_PUSH_DELAY seconds (i.e. the user has not answered in the
+    # Codex terminal). Mirrors the daemon path's grace period.
+    if fresh:
+        _timer = threading.Timer(
+            NOTIFY_PUSH_DELAY,
+            _push_notify_approval,
+            args=(approval_id, thread_id, turn_id, kind, command, cwd, reason, available),
+        )
+        _timer.daemon = True
+        _timer.start()
+
+        # Plan A: watch the Codex transcript for an in-TUI answer so a
+        # request the user already handled in the terminal is never pushed.
+        if transcript_path:
+            _w = threading.Thread(
+                target=_transcript_watcher,
+                args=(approval_id, transcript_path),
+                name="transcript-watcher-%s" % approval_id,
+            )
+            _w.daemon = True
+            _w.start()
+
+    return {"ok": True, "approval_id": approval_id, "event_id": "appr-" + approval_id}
+
+
+# Plan A: transcript signals that mean the pending approval was already
+# answered in the TUI. Any of these appearing AFTER the hook fired means the
+# user handled it locally, so the watch push should be cancelled.
+_TUI_ANSWER_ITEM_TYPES = ("CommandExecution", "McpToolCall")
+_TUI_ANSWER_EVENT_TYPES = ("turn_aborted", "task_complete")
+_TRANSCRIPT_WATCH_INTERVAL = 2
+_TRANSCRIPT_WATCH_TIMEOUT = 150
+
+
+def _transcript_decision_signal(rec):
+    """Return a short signal name if this transcript record shows the pending
+    approval was answered in the TUI, else None."""
+    if not isinstance(rec, dict):
+        return None
+    payload = rec.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    ptype = payload.get("type")
+    if ptype in _TUI_ANSWER_EVENT_TYPES:
+        return "event:%s" % ptype
+    if ptype == "item_completed":
+        item = payload.get("item")
+        if isinstance(item, dict) and item.get("type") in _TUI_ANSWER_ITEM_TYPES:
+            return "item:%s" % item.get("type")
+    return None
+
+
+def _resolve_notify_by_transcript(approval_id, signal):
+    conn = connect_db()
+    try:
+        cur = conn.execute(
+            """
+            UPDATE approvals
+            SET status = 'resolved',
+                decided_at = COALESCE(decided_at, ?),
+                decided_by = 'tui'
+            WHERE approval_id = ? AND status IN ('pending', 'sent')
+            """,
+            (int(time.time()), approval_id),
+        )
+        conn.commit()
+        if cur.rowcount:
+            log.info(
+                "transcript watcher resolved notify approval %s (signal=%s)",
+                approval_id, signal,
+            )
+    finally:
+        conn.close()
+
+
+def _transcript_watcher(approval_id, transcript_path):
+    """Tail the Codex transcript for a post-hook decision signal. When the
+    user answered the approval in the TUI, resolve the notify row so the
+    delayed push (and any already-sent push) is dropped. Read-only."""
+    last_size = 0
+    try:
+        if os.path.exists(transcript_path):
+            last_size = os.path.getsize(transcript_path)
+    except OSError:
+        last_size = 0
+
+    start = time.time()
+    while time.time() - start < _TRANSCRIPT_WATCH_TIMEOUT:
+        try:
+            size = os.path.getsize(transcript_path)
+        except OSError:
+            size = None
+        if size is not None and size > last_size:
+            chunk = b""
+            try:
+                with open(transcript_path, "rb") as fh:
+                    fh.seek(last_size)
+                    chunk = fh.read(size - last_size)
+                last_size = size
+            except OSError:
+                pass
+            if chunk:
+                for line in chunk.decode("utf-8", "replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    signal = _transcript_decision_signal(rec)
+                    if signal:
+                        _resolve_notify_by_transcript(approval_id, signal)
+                        return
+        elif size is not None and size < last_size:
+            # Rotated/truncated: only watch new appends going forward so we
+            # never match historical signals from a previous file.
+            last_size = size
+        time.sleep(_TRANSCRIPT_WATCH_INTERVAL)
+
+
+def _push_notify_approval(approval_id, thread_id, turn_id, kind, command, cwd, reason, available):
+    """Push a notify-hook approval to the watch only if it is still pending and
+    no daemon-path row is already covering the same turn (avoids duplicate cards)."""
+    conn = connect_db()
+    try:
+        row = conn.execute(
+            "SELECT status FROM approvals WHERE approval_id=?", (approval_id,)
+        ).fetchone()
+        if not row or row["status"] != "pending":
+            log.info(
+                "notify approval %s no longer pending (status=%s), skip push",
+                approval_id, row["status"] if row else "missing",
+            )
+            return
+        if turn_id:
+            sib = conn.execute(
+                """
+                SELECT 1 FROM approvals
+                WHERE thread_id=? AND turn_id=?
+                  AND request_id NOT LIKE 'notify:%'
+                  AND status IN ('pending','sent')
+                LIMIT 1
+                """,
+                (thread_id, turn_id),
+            ).fetchone()
+        else:
+            sib = conn.execute(
+                """
+                SELECT 1 FROM approvals
+                WHERE thread_id=?
+                  AND request_id NOT LIKE 'notify:%'
+                  AND status IN ('pending','sent')
+                  AND command=?
+                LIMIT 1
+                """,
+                (thread_id, command),
+            ).fetchone()
+        if sib:
+            log.info("notify approval %s has daemon sibling, skip duplicate push", approval_id)
+            return
+    finally:
+        conn.close()
+
     project = os.path.basename(cwd) if cwd else "codex"
     body = (command or reason or kind).strip().replace("\n", " ")
     if len(body) > 160:
         body = body[:157] + "..."
+    now = int(time.time())
 
     try:
         store_event({
@@ -344,15 +536,9 @@ def store_notify_approval(data):
             "created_at": now,
             "expires_at": None,
         })
+        log.info("notify approval %s pushed to watch (still pending after %ds)", approval_id, NOTIFY_PUSH_DELAY)
     except ValueError as exc:
         log.warning("approval event store failed: %r", exc)
-
-    log.info(
-        "NOTIFY-APPROVAL pending id=%s thread=%s kind=%s cmd=%s",
-        approval_id, thread_id, kind, (command or "")[:120],
-    )
-
-    return {"ok": True, "approval_id": approval_id, "event_id": "appr-" + approval_id}
 
 
 def resolve_thread_approvals(thread_id):
