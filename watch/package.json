@@ -1,11 +1,12 @@
 {
   "name": "codex-watch",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "",
   "main": "app.js",
   "type": "module",
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "preview:dev": "node scripts/preview-dev.mjs"
   },
   "author": "",
   "license": "ISC",

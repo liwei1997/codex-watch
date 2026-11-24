@@ -20,6 +20,7 @@ const phoneRequest = createSystemRequestRunner({
 let pollRunning = false
 let destroyed = false
 let pollTimerId = null
+let bridgeConnected = false
 const approvalNotifications = {}
 
 function log(message) {
@@ -54,10 +55,12 @@ function notifyEvent(event) {
     actions,
     vibrate: approval ? 1 : 0
   })
-  if (!notificationId) return false
-  if (approval && id) {
-    approvalNotifications[id] = notificationId
+  if (!notificationId) {
+    log('notification rejected event=' + String(event.event_id || ''))
+    return false
   }
+  log('notification sent event=' + String(event.event_id || '') + ' id=' + notificationId)
+  if (approval && id) approvalNotifications[id] = notificationId
   return true
 }
 
@@ -68,6 +71,8 @@ AppService(BasePage({
   onInit() {
     destroyed = false
     pollRunning = false
+    bridgeConnected = false
+    log('service started')
     this.pollBridge()
     try {
       pollTimerId = createSysTimer(true, POLL_INTERVAL_MS, () => this.pollBridge())
@@ -87,26 +92,32 @@ AppService(BasePage({
         'bridge.poll',
         () => this.request({ method: 'bridge.poll', params: { limit: 20 } }, { timeout: REQUEST_TIMEOUT })
       )
-      if (destroyed || !result || result.ok !== true) return
-      for (const event of result.notifications || []) {
+      if (destroyed) return
+      if (!result || result.ok !== true) throw new Error(result && result.error || 'invalid bridge response')
+      if (!bridgeConnected) log('bridge polling active')
+      bridgeConnected = true
+      const notifications = result.notifications || []
+      if (notifications.length) log('received notifications=' + notifications.length)
+      for (const event of notifications) {
         if (destroyed) break
         try {
           if (!notifyEvent(event)) continue
-          await phoneRequest.run(
+          const ack = await phoneRequest.run(
             'bridge.notification.ack',
             () => this.request({
               method: 'bridge.notification.ack',
               params: { event_id: event.event_id }
             }, { timeout: REQUEST_TIMEOUT })
           )
+          if (!ack || ack.ok !== true) throw new Error(ack && ack.error || 'notification acknowledgement failed')
+          log('notification acknowledged event=' + String(event.event_id || ''))
         } catch (error) {
           log('delivery failed: ' + String(error))
         }
       }
-      if (Object.keys(approvalNotifications).length) {
-        await this.checkStaleApprovals()
-      }
+      if (Object.keys(approvalNotifications).length) await this.checkStaleApprovals()
     } catch (error) {
+      bridgeConnected = false
       log('poll failed: ' + String(error))
     } finally {
       pollRunning = false
@@ -131,6 +142,7 @@ AppService(BasePage({
   },
 
   onDestroy() {
+    log('service stopped')
     destroyed = true
     if (pollTimerId !== null) {
       try { stopTimer(pollTimerId) } catch (error) {}

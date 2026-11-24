@@ -1,5 +1,5 @@
 import { BasePage } from '@zeppos/zml/base-page'
-import { createWidget, widget, prop } from '@zos/ui'
+import { createWidget, widget } from '@zos/ui'
 import { px } from '@zos/utils'
 import { push } from '@zos/router'
 import { requestPermission } from '@zos/app'
@@ -9,24 +9,27 @@ import { activateKeypad } from './keypad'
 
 const TAG = '[Codex Watch]'
 const BACKGROUND_SERVICE = 'app-service/codex_background'
-let backgroundStartInFlight = false
+let backgroundStartState = 'idle'
 
 function launchBackgroundService() {
-  if (backgroundStartInFlight) return
-  backgroundStartInFlight = true
+  if (backgroundStartState !== 'idle') return
+  backgroundStartState = 'starting'
   try {
     const result = start({
       file: BACKGROUND_SERVICE,
       reload: true,
       complete_func: status => {
-        backgroundStartInFlight = false
-        if (!status || status.result !== true) console.log(TAG + ' Background start failed')
+        backgroundStartState = status && status.result === true ? 'started' : 'idle'
+        console.log(TAG + ' Background service ' + backgroundStartState)
       }
     })
-    if (result !== 0) backgroundStartInFlight = false
+    if (result !== 0) {
+      backgroundStartState = 'idle'
+      console.log(TAG + ' Background service start rejected: ' + result)
+    }
   } catch (error) {
-    backgroundStartInFlight = false
-    console.log(TAG + ' Background exception: ' + String(error))
+    backgroundStartState = 'idle'
+    console.log(TAG + ' Background service start failed: ' + String(error))
   }
 }
 
@@ -65,12 +68,22 @@ Page(BasePage({
   },
 
   startBackground() {
-    requestPermission({
-      permissions: ['device:os.bg_service'],
-      callback: result => {
-        if (Array.isArray(result) && result[0] === 2) launchBackgroundService()
-      }
-    })
+    try {
+      const result = requestPermission({
+        permissions: ['device:os.bg_service'],
+        callback: permissions => {
+          console.log(TAG + ' Background permission callback: ' + JSON.stringify(permissions))
+          if (Array.isArray(permissions) && permissions[0] === 2) {
+            launchBackgroundService()
+          }
+        }
+      })
+      console.log(TAG + ' Background permission result: ' + result)
+      if (result === 2) launchBackgroundService()
+      else if (result === 1) console.log(TAG + ' Background permission cannot be requested')
+    } catch (error) {
+      console.log(TAG + ' Background permission failed: ' + String(error))
+    }
   },
 
   async load() {
@@ -104,6 +117,8 @@ Page(BasePage({
 
   onResume() {
     this.load()
+    this.startBackground()
+    if (!this.refreshTimer) this.refreshTimer = setInterval(() => this.load(), 30000)
     activateKeypad(action => {
       if (action === 'select') this.openApprovals()
       return action === 'up' || action === 'down' || action === 'select'
