@@ -427,6 +427,19 @@ Page(BasePage({
 
     const jsProbe = this.probePhoneJs()
 
+    // The JS generation probe is the fastest of the three
+    // requests. While the rest of the dashboard is still
+    // syncing, surface its result in the status row so the
+    // installed phone-side JS is visible at a glance on open.
+    jsProbe.then((label) => {
+      if (this.destroyed || !this.linkStatus) {
+        return
+      }
+      if (this.linkStatus.text.indexOf('SYNCING') === 0) {
+        this.setLinkStatus('SYNCING... · ' + label, COLORS.muted)
+      }
+    })
+
     // The two requests are independent: in v1.1.0 a single
     // failed/slow endpoint (e.g. the side service still
     // booting) failed the whole Promise.all and the page
