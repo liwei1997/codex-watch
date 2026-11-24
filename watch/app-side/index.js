@@ -16,7 +16,7 @@ const DEFAULT_CONSUMER_ID = 'iphone'
 
 // Bump this on every app-side change; the watch home page probes it via
 // bridge.version and shows the generation actually running on the phone.
-const SIDE_JS_MARK = '113-20261124'
+const SIDE_JS_MARK = '114-20261124'
 const REQUEST_TIMEOUT = 10000
 
 // ========================================

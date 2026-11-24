@@ -491,13 +491,6 @@ Page(BasePage({
 
     this.busyLoad = false
 
-    let jsLabel = null
-    try {
-      jsLabel = await jsProbe
-    } catch (error) {
-      jsLabel = 'JS ?'
-    }
-
     if (this.destroyed) {
       return
     }
@@ -512,7 +505,7 @@ Page(BasePage({
 
     if (approvalsError && historyError) {
       this.setLinkStatus(
-        'OFFLINE ' + jsLabel + ' · ' + shortError(approvalsError, 12),
+        'OFFLINE ' + shortError(approvalsError, 12),
         COLORS.redText
       )
       this.scheduleFastRetry()
