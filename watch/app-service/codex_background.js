@@ -11,27 +11,6 @@ import {
   buildApprovalActionParam
 } from '../common/format'
 
-// ============================================================
-// Codex Watch - Background Message Service
-//
-// Zepp OS 4.0
-// Amazfit T-Rex 3 Pro
-//
-// Watch App Service
-//   -> ZML
-//   -> iPhone Side Service
-//   -> Cloudflare Tunnel
-//   -> Ubuntu Bridge
-//
-// Polls every 10 seconds while the Zepp OS background service is running.
-//
-//   * approval_request events become system notifications
-//     with APPROVE / REJECT action buttons that launch
-//     app-service/approval_action.
-//   * other events become plain notifications.
-//   * when a tracked approval no longer shows as pending,
-//     its notification is cancelled (stale-approval cleanup).
-// ============================================================
 
 const TAG = '[Codex Watch Background]'
 
@@ -46,9 +25,6 @@ const ACTION_SERVICE = 'app-service/approval_action'
 
 const timeSensor = new Time()
 
-// ZML's built-in request timeout uses a regular setTimeout, which is not
-// available in App Service. Guard every phone request with Zepp OS's system
-// timer so one lost BLE response cannot block all later polling cycles.
 const phoneRequest = createSystemRequestRunner({
   timeoutMs: PHONE_REQUEST_TIMEOUT,
   createTimer: createSysTimer,
@@ -60,12 +36,8 @@ let destroyed = false
 let minuteCount = 0
 let pollTimerId = null
 
-// Prevent repeated notifications in the current service instance
-// when the notification succeeded but the ACK failed.
 const notifiedEvents = {}
 
-// approval_id -> { event_id, notification_id } for approval
-// notifications that may still need to be cancelled.
 const approvalNotifications = {}
 
 function log(message) {
@@ -123,10 +95,6 @@ function sendSystemNotification(event) {
   const approvalId = isApproval
     ? String(payload.approval_id || '')
     : ''
-  // The bridge tags real Codex notify-hook approvals with source
-  // "codex-notify", and its /v1/approvals marks them non-actionable,
-  // but its decision endpoint handles them normally. If the watch
-  // can name the approval, it can decide it.
   const actionableApproval = isApproval && approvalId !== ''
 
   let title = String(event.title || 'Codex Watch').slice(0, 60)
@@ -196,15 +164,11 @@ function sendSystemNotification(event) {
   return true
 }
 
-// ============================================================
-// Background Service
-// ============================================================
 
 AppService(
   BasePage({
     state: {},
 
-    // BasePage compatibility: no UI is created.
     build() {},
 
     onInit() {
@@ -216,12 +180,8 @@ AppService(
 
       const service = this
 
-      // Run an initial poll when the background service starts.
       service.pollBridge()
 
-      // System timer handles sub-minute polling when the service is alive.
-      // Keep the minute sensor as a fallback in case the periodic timer is
-      // throttled by the OS; pollRunning prevents concurrent requests.
       try {
         pollTimerId = createSysTimer(
           true,
@@ -286,8 +246,6 @@ AppService(
 
         log('Poll OK, count=' + events.length)
 
-        // Drain the small batch, with approvals sorted first by Bridge.
-        // ACK only after notify() reports success.
         for (const item of events) {
           if (destroyed) break
           const eventId = String(item.event_id || '')
@@ -328,8 +286,6 @@ AppService(
           }
         }
 
-        // Drop notifications for approvals that are no longer
-        // pending (decided from the watch, terminal, or expired).
         if (Object.keys(approvalNotifications).length > 0) {
           await this.checkStaleApprovals()
         }
@@ -372,7 +328,6 @@ AppService(
 
         if (!result || result.ok !== true ||
           !Array.isArray(result.approvals)) {
-          // Unknown state: keep the notifications.
           return
         }
 

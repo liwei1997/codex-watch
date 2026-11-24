@@ -9,23 +9,6 @@ import {
 
 import { px } from '@zos/utils'
 
-// ============================================================
-// Shared UI primitives (Zepp OS 4.0)
-//
-// TOUCH (v1.1.1 fix): FILL_RECT has NO click_func parameter
-// in the 4.0 API — it is silently ignored, which is why the
-// v1.1.0 cards were untouchable. Tappable surfaces use the
-// generic widget event API instead:
-//
-//   attachClick(card, handler)      // CLICK_DOWN on the card
-//   setPassThrough(overlayingWidget)// let touches fall through
-//                                   // texts/dots stacked above
-//
-// Per the 4.0 docs, setEnable(false) means the widget does
-// not respond to screen gesture events: it stays visible but
-// stops intercepting touches, so the FILL_RECT below receives
-// CLICK_DOWN.
-// ============================================================
 
 export const COLORS = {
   background: 0x0b1117,
@@ -61,8 +44,6 @@ export function drawBackground() {
   })
 }
 
-// Make a plain widget (e.g. a FILL_RECT card) tappable.
-// CLICK_DOWN is the official 4.0 touch event.
 export function attachClick(targetWidget, onClick) {
   if (
     !targetWidget ||
@@ -78,9 +59,6 @@ export function attachClick(targetWidget, onClick) {
   }
 }
 
-// Widgets stacked above a tappable widget (texts, dots,
-// frames) intercept gesture events. Disable their gesture
-// response so touches reach the widget below.
 export function setPassThrough(targetWidget) {
   if (
     !targetWidget ||
@@ -96,7 +74,6 @@ export function setPassThrough(targetWidget) {
   }
 }
 
-// Compact one-line error text for on-device status display.
 export function shortError(error, max = 24) {
   const s = String(
     error && error.message ? error.message : error || 'ERROR'
@@ -128,8 +105,6 @@ export function addText(
     text_style: text_style.WRAP
   })
 
-  // Text stacked on a tappable card must not swallow the
-  // touch: let CLICK_DOWN fall through to the card.
   if (options.passThrough) {
     setPassThrough(textWidget)
   }
@@ -184,14 +159,9 @@ export function addButton(
 
     radius: px(radius),
 
-    // BUTTON is the documented 4.0 widget that supports
-    // click_func directly.
     click_func: onClick
   })
 
-  // White focus frame, color-driven visibility.
-  // setEnable(false) = gesture pass-through only (4.0 doc),
-  // so the frame never blocks the button's touch.
   const focusFrame = createWidget(widget.STROKE_RECT, {
     x: px(x - 5),
     y: px(y - 5),
@@ -201,7 +171,6 @@ export function addButton(
     radius: px(radius + 5),
     line_width: px(4),
 
-    // Hidden until selected
     color: COLORS.background
   })
 
@@ -213,8 +182,6 @@ export function addButton(
   }
 }
 
-// Pass the STROKE_RECT focus frame widget (e.g. item.focusFrame
-// from addButton(), or a raw frame created for a card).
 export function setButtonFocus(focusFrame, focused) {
   focusFrame.setProperty(prop.MORE, {
     color: focused

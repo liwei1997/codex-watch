@@ -30,31 +30,6 @@ import {
   ageText
 } from '../common/format'
 
-// ============================================================
-// Codex Watch - Home (live dashboard)
-//
-// Zepp OS 4.0 / Amazfit T-Rex 3 Pro
-//
-// Two tappable cards:
-//   APPROVALS  -> page/approvals (pending queue + decisions)
-//   MESSAGES   -> page/inbox     (scrollable event history)
-//
-// Touch (v1.1.2): the two cards are BUTTON widgets
-// (click_func) - the only tappable surface verified on
-// this firmware. Texts stacked on top are gesture
-// pass-through. Focus frames sit BELOW the cards in
-// Z-order and are color-driven, so nothing blocks or
-// hides anything.
-//
-// Data (v1.1.1): the two dashboard requests run
-// independently with an explicit 15s timeout. A failed
-// endpoint shows PARTIAL data instead of killing the whole
-// page, and fast retries (3s/6s) recover from the startup
-// race that left v1.1.0 stuck on OFFLINE.
-//
-// Refreshes every 60s while visible and launches the
-// background App Service that pushes new Codex events.
-// ============================================================
 
 const TAG = '[Codex Watch]'
 
@@ -77,9 +52,6 @@ const CARDS = [
   }
 ]
 
-// ============================================================
-// Background App Service
-// ============================================================
 
 let backgroundStartInFlight = false
 
@@ -149,7 +121,6 @@ function startCodexBackground() {
 
     console.log(TAG + ' Permission request return: ' + permissionResult)
 
-    // 2 means permission was already granted.
     if (permissionResult === 2) {
       launchBackgroundService()
     }
@@ -158,9 +129,6 @@ function startCodexBackground() {
   }
 }
 
-// ============================================================
-// Home page
-// ============================================================
 
 Page(BasePage({
   state: {},
@@ -187,20 +155,15 @@ Page(BasePage({
     this.startAutoRefresh()
     this.loadDashboard()
 
-    // Launch the push-notification service after UI init.
     startCodexBackground()
   },
 
-  // ----------------------------------------------------------
-  // UI
-  // ----------------------------------------------------------
 
   drawHome() {
     drawBackground()
 
     addText('CODEX WATCH', 60, 34, 360, 34, 26, COLORS.white)
 
-    // Link status row
     this.linkDot = createWidget(widget.FILL_RECT, {
       x: px(118),
       y: px(80),
@@ -214,13 +177,6 @@ Page(BasePage({
       'SYNCING...', 142, 74, 240, 24, 15, COLORS.muted, 0
     )
 
-    // Cards with their focus frames.
-    //
-    // Z-order per card: frame first (below), then the
-    // BUTTON card, then the pass-through texts on top.
-    // The frame is color-driven (background = hidden) so it
-    // never relies on setEnable for visibility, and being
-    // below the card it can never block the card's touch.
     this.focusFrames = []
     const self = this
 
@@ -238,9 +194,6 @@ Page(BasePage({
       })
       self.focusFrames.push(frame)
 
-      // BUTTON is the only widget that fires click_func on
-      // this firmware (verified v1.1.2); FILL_RECT +
-      // addEventListener(CLICK_DOWN) does not.
       const button = createWidget(widget.BUTTON, {
         x: px(55),
         y: px(y),
@@ -295,9 +248,6 @@ Page(BasePage({
     })
   },
 
-  // ----------------------------------------------------------
-  // Navigation
-  // ----------------------------------------------------------
 
   openCard(i) {
     const card = CARDS[i]
@@ -317,9 +267,6 @@ Page(BasePage({
     }
   },
 
-  // ----------------------------------------------------------
-  // Data
-  // ----------------------------------------------------------
 
   nowText() {
     const d = new Date()
@@ -383,11 +330,6 @@ Page(BasePage({
     }
   },
 
-  // Probe which generation of app-side JS the phone is actually running.
-  // Primary path: bridge.version returns the build marker (SIDE_JS_MARK).
-  // Fallback labels when that call fails: 'JS NOVER' when the phone side
-  // answers but has no version method (older JS generation), 'JS DOWN'
-  // when the side service is unreachable.
   probePhoneJs() {
     return this.request(
       { method: 'bridge.version', params: {} },
@@ -427,10 +369,6 @@ Page(BasePage({
 
     const jsProbe = this.probePhoneJs()
 
-    // The JS generation probe is the fastest of the three
-    // requests. While the rest of the dashboard is still
-    // syncing, surface its result in the status row so the
-    // installed phone-side JS is visible at a glance on open.
     jsProbe.then((label) => {
       if (this.destroyed || !this.linkStatus) {
         return
@@ -440,10 +378,6 @@ Page(BasePage({
       }
     })
 
-    // The two requests are independent: in v1.1.0 a single
-    // failed/slow endpoint (e.g. the side service still
-    // booting) failed the whole Promise.all and the page
-    // sat on OFFLINE until the next 60s tick.
     let approvals = null
     let approvalsError = null
     let events = null
@@ -532,8 +466,6 @@ Page(BasePage({
     }
   },
 
-  // Fast retries after a failure so the page recovers in
-  // seconds instead of waiting for the 60s refresh tick.
   scheduleFastRetry() {
     if (this.fastRetryTimer) {
       return
@@ -558,9 +490,6 @@ Page(BasePage({
     }, delay)
   },
 
-  // ----------------------------------------------------------
-  // Auto refresh
-  // ----------------------------------------------------------
 
   startAutoRefresh() {
     if (this.refreshTimer) {
@@ -579,9 +508,6 @@ Page(BasePage({
     }
   },
 
-  // ----------------------------------------------------------
-  // Hardware buttons
-  // ----------------------------------------------------------
 
   handleKeyAction(action) {
     if (action === 'up') {
@@ -608,8 +534,6 @@ Page(BasePage({
     this.isNavigating = false
     console.log(TAG + ' Home resumed')
 
-    // A back navigation destroys the previous page's keypad
-    // handler; re-claim it for this page.
     try {
       activateKeypad((action) => this.handleKeyAction(action))
     } catch (error) {
@@ -634,8 +558,5 @@ Page(BasePage({
       this.fastRetryTimer = null
     }
 
-    // Keep the background service running.
-    // The shared keypad handler is sticky: the visible page
-    // re-activates it in build()/onResume().
   }
 }))

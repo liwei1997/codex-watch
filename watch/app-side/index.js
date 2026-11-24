@@ -2,26 +2,14 @@ import { BaseSideService } from '@zeppos/zml/base-side'
 
 import { BRIDGE_URL, BRIDGE_TOKEN } from './bridge-config'
 
-// ========================================
-// Bridge Configuration
-// ========================================
 
-// 改成 iPhone 能访问到的 Ubuntu IP 或域名
 const BRIDGE_BASE_URL = BRIDGE_URL
-// 填入 Ubuntu Bridge 使用的 CODEX_WATCH_TOKEN
-// 注意：这里不能直接写 $CODEX_WATCH_TOKEN
-// BRIDGE_TOKEN 来自 ./bridge-config（该文件含真实 token，已 gitignore，不入库）
 
 const DEFAULT_CONSUMER_ID = 'iphone'
 
-// Bump this on every app-side change; the watch home page probes it via
-// bridge.version and shows the generation actually running on the phone.
 const SIDE_JS_MARK = '114-20261124'
 const REQUEST_TIMEOUT = 10000
 
-// ========================================
-// Helpers
-// ========================================
 
 function parseResponseBody(body) {
   if (body === null || body === undefined || body === '') {
@@ -81,9 +69,6 @@ async function requestBridge(service, options) {
   return body
 }
 
-// ========================================
-// Side Service
-// ========================================
 
 AppSideService(
   BaseSideService({
@@ -100,9 +85,6 @@ AppSideService(
       console.log('[Codex Watch] Side Service running')
     },
 
-    // ------------------------------------
-    // Requests from Watch
-    // ------------------------------------
 
     async onRequest(req, res) {
       const method = req.method
@@ -114,9 +96,6 @@ AppSideService(
 
       try {
 
-        // ==================================
-        // Version probe (diagnostic)
-        // ==================================
 
         if (method === 'bridge.version') {
 
@@ -136,9 +115,6 @@ AppSideService(
           return
         }
 
-        // ==================================
-        // Poll events
-        // ==================================
 
         if (method === 'bridge.poll') {
 
@@ -191,9 +167,6 @@ AppSideService(
           return
         }
 
-        // ==================================
-        // Event history (delivered + pending)
-        // ==================================
 
         if (method === 'bridge.history') {
 
@@ -235,9 +208,6 @@ AppSideService(
           return
         }
 
-        // ==================================
-        // Acknowledge event
-        // ==================================
 
         if (method === 'bridge.ack') {
 
@@ -272,9 +242,6 @@ AppSideService(
           return
         }
 
-        // ==================================
-        // List approvals
-        // ==================================
 
         if (method === 'bridge.approval.list') {
 
@@ -314,9 +281,6 @@ AppSideService(
           return
         }
 
-        // ==================================
-        // Approve / reject an approval
-        // ==================================
 
         if (method === 'bridge.approval.decision') {
 
@@ -353,9 +317,6 @@ AppSideService(
           return
         }
 
-        // ==================================
-        // Unknown request
-        // ==================================
 
         console.log(
           '[Codex Watch] Unknown method: ' + method
@@ -379,9 +340,6 @@ AppSideService(
       }
     },
 
-    // ------------------------------------
-    // Notifications from Watch
-    // ------------------------------------
 
     onCall(data) {
       console.log(

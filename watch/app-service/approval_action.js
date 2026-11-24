@@ -10,17 +10,6 @@ import {
   truncate
 } from '../common/format'
 
-// ============================================================
-// Codex Watch - Approval Action Service
-//
-// Launched when the user taps APPROVE / REJECT on an approval
-// push notification. Sends the decision through the phone to
-// the bridge, shows a small result notification, and exits.
-//
-// The action `param` arrives via onInit(params) when this
-// service was started by the tap, or via onEvent(data) when
-// the service was already running.
-// ============================================================
 
 const TAG = '[Codex Watch ApprovalAction]'
 const PHONE_REQUEST_TIMEOUT = 15000
@@ -64,7 +53,6 @@ AppService(
   BasePage({
     state: {},
 
-    // BasePage compatibility: no UI is created.
     build() {},
 
     onInit(params) {

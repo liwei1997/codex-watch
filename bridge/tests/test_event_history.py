@@ -116,7 +116,6 @@ class EventHistoryTest(unittest.TestCase):
         self.assertIsNone(events["undelivered-1"]["watch_received_at"])
 
     def test_expired_undelivered_events_are_hidden(self):
-        # Expired before "now" and never delivered: dead backlog, hidden.
         with sqlite3.connect(server.DB_PATH) as conn:
             insert_event(
                 conn, "expired-hidden", self.now - 100,

@@ -38,7 +38,6 @@ export function createSystemRequestRunner(options) {
         try {
           stopTimer(id)
         } catch (error) {
-          // A completed request must not fail because timer cleanup did.
         }
       }
 

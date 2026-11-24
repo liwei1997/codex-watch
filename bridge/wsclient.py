@@ -28,8 +28,6 @@ DAEMON_SOCK = os.environ.get(
     "/home/liwei/.codex/app-server-control/app-server-control.sock",
 )
 
-# Notifications worth keeping at INFO level in a long-lived daemon;
-# everything else is demoted to debug to keep the log usable.
 INTERESTING_NOTIF = frozenset({
     "thread/status/changed",
     "thread/started",
@@ -38,7 +36,6 @@ INTERESTING_NOTIF = frozenset({
     "turn/completed",
 })
 
-# WebSocket liveness: ping every 30s; disconnect if no data for 90s
 PING_INTERVAL = 30
 LIVENESS_TIMEOUT = 300
 
@@ -64,7 +61,7 @@ def _ws_handshake(s):
     head = buf.split(b"\r\n\r\n", 1)[0].decode()
     if "101" not in head.split("\r\n", 1)[0]:
         raise RuntimeError(f"handshake failed: {head}")
-    return buf.split(b"\r\n\r\n", 1)[1]  # any leftover payload
+    return buf.split(b"\r\n\r\n", 1)[1]
 
 
 def _send_frame(s, payload: bytes, opcode=0x1):
@@ -119,8 +116,6 @@ class WSClient:
         self.on_notification = on_notification
         self.on_server_request = on_server_request
         self.on_close = on_close
-        # Client request ids start far above the daemon's server-request id
-        # space (small per-thread sequences) to avoid collisions.
         self.next_id = id_offset + int(time.time()) % 100_000
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(30)
@@ -202,12 +197,10 @@ class WSClient:
                     b0, b1 = _recv_exact(self.sock, 2)
                     last_data = time.time()
                 else:
-                    # No data: check liveness timeout
                     if time.time() - last_data > LIVENESS_TIMEOUT:
                         log.warning("%s: no data for %ss, forcing reconnect",
                                     self.name, LIVENESS_TIMEOUT)
                         break
-                    # Periodic ping to keep connection alive
                     if time.time() - last_ping > PING_INTERVAL:
                         try:
                             with self.lock:
@@ -235,19 +228,19 @@ class WSClient:
                 break
             if mask:
                 payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-            if opcode == 0x8:  # close
+            if opcode == 0x8:
                 self.log("WS-CLOSE", payload[:100])
                 break
-            if opcode == 0x9:  # ping -> pong
+            if opcode == 0x9:
                 try:
                     with self.lock:
                         _send_frame(self.sock, payload, opcode=0xA)
                 except OSError:
                     break
                 continue
-            if opcode == 0xA:  # pong (just a liveness signal)
+            if opcode == 0xA:
                 continue
-            if opcode in (0x0, 0x1, 0x2):  # continuation / text / binary
+            if opcode in (0x0, 0x1, 0x2):
                 self.buf += payload
                 try:
                     self._drain()
@@ -259,7 +252,6 @@ class WSClient:
         if self.closed:
             return
         self.closed = True
-        # Fail any outstanding request() waits.
         for rid, (fut, box) in list(self.pending.items()):
             box["error"] = {"code": -1, "message": "connection closed"}
             fut.set()
@@ -292,7 +284,7 @@ class WSClient:
                         except Exception:
                             self.log("BADFRAME", line[:300])
                     continue
-                self.buf = text.encode("utf-8")  # incomplete; wait for more
+                self.buf = text.encode("utf-8")
                 return
             self.handle(obj)
             text = text[end:]

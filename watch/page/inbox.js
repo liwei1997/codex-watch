@@ -29,22 +29,6 @@ import {
   eventKindLabel
 } from '../common/format'
 
-// ============================================================
-// Codex Watch - Inbox
-//
-// Scrollable, newest-first event history from
-// GET /v1/events/history. Cards show kind badge, title,
-// machine and age; undelivered events carry a NEW dot and
-// are ACKed once displayed (so the background service does
-// not re-push them).
-//
-// Touch (v1.1.2): cards are BUTTON widgets (click_func)
-// — the only tappable surface verified on this firmware —
-// with gesture pass-through texts/dots stacked on top.
-//
-// Data (v1.1.1): requests carry an explicit 15s timeout and
-// fast retries (3s/6s) after a failure.
-// ============================================================
 
 const TAG = '[Codex Watch Inbox]'
 
@@ -55,7 +39,6 @@ const MAX_AUTO_ACK = 5
 const REQUEST_TIMEOUT = 15000
 const FAST_RETRY_DELAYS_MS = [3000, 6000]
 
-// List geometry (screen coordinates)
 const LIST_X = 52
 const LIST_Y = 138
 const LIST_W = 376
@@ -101,8 +84,6 @@ Page(
         14, COLORS.muted
       )
 
-      // Scroll container (falls back to a static list if the
-      // device does not provide VIEW_CONTAINER).
       this.createList()
 
       const items = [
@@ -152,14 +133,10 @@ Page(
         console.log(TAG + ' Keypad activate failed: ' + String(error))
       }
 
-      // Initial sync + periodic refresh while visible.
       this.sync()
       this.syncTimer = setInterval(() => this.sync(), SYNC_MS)
     },
 
-    // ----------------------------------------------------------
-    // List rendering
-    // ----------------------------------------------------------
 
     createList() {
       try {
@@ -193,8 +170,6 @@ Page(
 
     createChild(x, y, w, h, type, props) {
       if (this.containerOk) {
-        // Container coordinates: x/y are relative to the
-        // container's top-left corner.
         return this.container.createWidget(type, {
           ...props,
           x: px(x),
@@ -202,7 +177,6 @@ Page(
         })
       }
 
-      // Fallback: place directly on the page.
       return createWidget(type, {
         ...props,
         x: px(LIST_X + x),
@@ -215,7 +189,6 @@ Page(
         try {
           deleteWidget(w)
         } catch (error) {
-          // ignore
         }
       })
 
@@ -227,7 +200,6 @@ Page(
         try {
           this.container.setProperty(prop.MORE, { pos_y: 0 })
         } catch (error) {
-          // ignore
         }
       }
     },
@@ -277,8 +249,6 @@ Page(
         const kindColor = KIND_COLORS[kind] || COLORS.muted
         const isApproval = event.type === 'approval_request'
 
-        // BUTTON is the only widget that fires click_func on
-        // this firmware (verified v1.1.2).
         const card = this.createChild(0, y, LIST_W, CARD_H,
           widget.BUTTON, {
             w: px(LIST_W),
@@ -291,8 +261,6 @@ Page(
             click_func: () => this.onCardTap(event)
           })
 
-        // Texts on top of the card must let the touch fall
-        // through to the card.
         this.listWidgets.push(
           card,
           this.createTextInList(
@@ -358,9 +326,6 @@ Page(
       }
     },
 
-    // ----------------------------------------------------------
-    // Data
-    // ----------------------------------------------------------
 
     async sync(options) {
       if (this.destroyed || this.loading) {
@@ -430,8 +395,6 @@ Page(
       }
     },
 
-    // Fast retries after a failure so the page recovers in
-    // seconds instead of waiting for the 30s sync tick.
     scheduleFastRetry() {
       if (this.fastRetryTimer) {
         return
@@ -455,14 +418,7 @@ Page(
       }, delay)
     },
 
-    // Events shown on screen count as received. ACK the newest
-    // undelivered ones so the background service will not push
-    // duplicates after it restarts.
     async ackDisplayed() {
-      // Approval events are intentionally left for the
-      // background service: it creates the notification with
-      // APPROVE/REJECT buttons and only ACKs after the push
-      // succeeded. ACKing them here would suppress the push.
       const undelivered = this.events
         .filter(
           (e) => !e.delivered && e.type !== 'approval_request'
@@ -501,9 +457,6 @@ Page(
       )
     },
 
-    // ----------------------------------------------------------
-    // Keys
-    // ----------------------------------------------------------
 
     handleKeypad(action, updateFocus) {
       if (action === 'up' || action === 'down') {
@@ -529,15 +482,10 @@ Page(
       return false
     },
 
-    // ----------------------------------------------------------
-    // Lifecycle
-    // ----------------------------------------------------------
 
     onResume() {
       console.log(TAG + ' resumed')
 
-      // A back navigation destroys the previous page's keypad
-      // handler; re-claim it for this page.
       try {
         activateKeypad((action) => this.handleKeypad(action, this.updateListFocus))
       } catch (error) {
@@ -571,10 +519,6 @@ Page(
 
       this.clearList()
 
-      // Sticky keypad: the visible page re-activates the shared
-      // handler in build()/onResume(); do not deactivate here,
-      // this page may be destroyed after the previous page has
-      // already re-activated its own handler.
     }
   })
 )

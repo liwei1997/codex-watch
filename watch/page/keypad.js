@@ -7,19 +7,6 @@ import {
   KEY_EVENT_LONG_PRESS
 } from '@zos/interaction'
 
-// ============================================================
-// Shared physical-key handler (singleton).
-//
-// Only ONE onKey registration is allowed for the whole app,
-// so every page funnels through this module. The page that is
-// visible activates its handler; when a page is destroyed the
-// handler is deactivated.
-//
-// Both short clicks (KEY_EVENT_CLICK) and long presses
-// (KEY_EVENT_LONG_PRESS) produce actions. A long press is
-// followed by a click on key release; that trailing click is
-// suppressed so one physical press yields exactly one action.
-// ============================================================
 
 let activeHandler = null
 let registered = false
@@ -60,7 +47,6 @@ function registerKeyListener() {
       }
 
       if (event === KEY_EVENT_LONG_PRESS) {
-        // The trailing click on release must not re-fire.
         suppressClickUntil = Date.now() + CLICK_SUPPRESS_MS
         console.log('[Keypad] LONG:', action)
         return activeHandler(action) !== false

@@ -1,11 +1,4 @@
-// ============================================================
-// Codex Watch - shared pure helpers
-//
-// No Zepp OS imports here: this module is unit-tested with
-// plain Node and is bundled by zeus for pages and app services.
-// ============================================================
 
-// Shell wrappers Codex may add around a command.
 const WRAPPER_PATTERNS = [
   /^\/bin\/bash\s+-lc\s+(['"])([\s\S]*)\1\s*$/,
   /^\/bin\/bash\s+lc\s+(['"])([\s\S]*)\1\s*$/,
@@ -15,7 +8,6 @@ const WRAPPER_PATTERNS = [
   /^sh\s+-lc\s+(['"])([\s\S]*)\1\s*$/
 ]
 
-// Strip a shell wrapper like:  /bin/bash -lc 'git push origin main'
 export function cleanCommand(cmd) {
   if (cmd === null || cmd === undefined) {
     return ''
@@ -32,13 +24,11 @@ export function cleanCommand(cmd) {
     }
   }
 
-  // Last-resort: an unquoted wrapper, e.g. /bin/bash -lc git status
   s = s.replace(/^\/?bin\/(bash|sh)\s+(-l|-lc|c)\s+/, '')
 
   return s.trim()
 }
 
-// Basename of a cwd path, e.g. /home/me/proj/clam-uwb -> clam-uwb
 export function projectOf(cwd) {
   if (!cwd) {
     return 'codex'
@@ -49,7 +39,6 @@ export function projectOf(cwd) {
   return parts.length > 0 ? parts[parts.length - 1] : 'codex'
 }
 
-// Build the JSON `param` string carried by a notification action.
 export function buildApprovalActionParam(approvalId, decision) {
   return JSON.stringify({
     approval_id: String(approvalId),
@@ -57,10 +46,6 @@ export function buildApprovalActionParam(approvalId, decision) {
   })
 }
 
-// Parse an action param back into { approval_id, decision }.
-// Accepts the raw JSON string, an already-parsed object, or an
-// object wrapping the string under a `param` key. Returns null
-// when the payload is unusable.
 export function parseApprovalActionParam(param) {
   let value = param
 
@@ -99,7 +84,6 @@ export function parseApprovalActionParam(param) {
   return { approval_id: approvalId, decision: decision }
 }
 
-// Human age for an epoch-seconds timestamp.
 export function ageText(createdSec, nowSec) {
   if (
     createdSec === null ||
@@ -144,7 +128,6 @@ export function truncate(text, max) {
   return s.slice(0, Math.max(0, max - 1)) + '…'
 }
 
-// Short uppercase badge for an event type.
 export function eventKindLabel(type) {
   switch (String(type || '')) {
     case 'approval_request':

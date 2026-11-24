@@ -81,7 +81,6 @@ def build_event(notification):
 
     project_name = Path(cwd).name if cwd else "Codex"
 
-    # Deterministic ID prevents duplicate events for the same turn.
     if thread_id and turn_id:
         event_id = str(uuid.uuid5(
             uuid.NAMESPACE_URL,
@@ -160,8 +159,6 @@ def build_approval_data(notification):
             ("available-decisions", "availableDecisions",
              "available_decisions"))
 
-    # "type" is the notification discriminator; only reuse it as kind if
-    # it is not the discriminator itself.
     if not kind:
         maybe_kind = _first(notification, ("kind", "type"))
         if maybe_kind and maybe_kind != notification.get("type"):
@@ -281,7 +278,6 @@ def main():
         )
 
     except (Exception, HTTPError, URLError) as exc:
-        # Notifications must never interrupt the Codex workflow.
         print(
             f"[Codex Watch] Notification failed: {exc}",
             file=sys.stderr,

@@ -45,7 +45,6 @@ MACHINE_ID = os.getenv("CODEX_WATCH_MACHINE_ID", "ubuntu-main")
 
 ALL_SOURCE_KINDS = ["cli", "vscode", "exec", "appServer", "subAgent", "unknown"]
 
-# Server-request methods that map to a watch-able approval.
 APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
     "execCommandApproval",
@@ -56,9 +55,9 @@ APPROVAL_METHODS = {
 
 VALID_DECISIONS = ("accept", "decline", "cancel")
 
-EVENT_TTL = 3600  # approval notifications expire after 1 hour
-APPROVAL_PUSH_DELAY = 60  # seconds to wait before pushing approval to watch
-REJOIN_LIMIT = 20  # max persisted threads to rejoin on reconnect
+EVENT_TTL = 3600
+APPROVAL_PUSH_DELAY = 60
+REJOIN_LIMIT = 20
 
 
 def _connect_db(db_path):
@@ -85,19 +84,16 @@ def _bindable(value):
 class DaemonClient:
     def __init__(self, db_path, event_sink=None, sock_path=DAEMON_SOCK):
         self.db_path = db_path
-        self.event_sink = event_sink  # fn(event_fields: dict) -> None
+        self.event_sink = event_sink
         self.sock_path = sock_path
-        self.client = None            # current WSClient (None while offline)
-        self.joined = set()           # thread ids this connection has joined
+        self.client = None
+        self.joined = set()
         self._stop = threading.Event()
         self._closed = threading.Event()
         self._thread = None
-        self._join_attempts = set()   # thread ids with a join worker running
+        self._join_attempts = set()
         self._attempts_lock = threading.Lock()
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
 
     def start(self):
         self._thread = threading.Thread(
@@ -153,7 +149,6 @@ class DaemonClient:
                 self._restore_threads()
             except Exception as e:
                 log.warning("thread restore failed: %r", e)
-            # Block until the reader signals close.
             self._closed.wait()
         finally:
             client.close()
@@ -161,9 +156,6 @@ class DaemonClient:
                 self.client = None
             log.info("daemon connection closed")
 
-    # ------------------------------------------------------------------
-    # Thread membership
-    # ------------------------------------------------------------------
 
     def _restore_threads(self):
         """Join live threads after (re)connect and refresh the persisted set."""
@@ -207,7 +199,6 @@ class DaemonClient:
                 )
                 if st == "active":
                     self._join_thread(tid)
-            # Rejoin threads we were watching in a previous run.
             rows = conn.execute(
                 """
                 SELECT thread_id FROM daemon_threads
@@ -217,8 +208,6 @@ class DaemonClient:
             ).fetchall()
             for row in rows:
                 self._join_thread(row["thread_id"])
-            # Pending approvals whose thread is no longer active cannot be
-            # resolved anymore (daemon restarted / turn gone).
             active_ids = {
                 t.get("id") for t in data
                 if ((t.get("status") or {}).get("type")) == "active"
@@ -255,7 +244,7 @@ class DaemonClient:
         try:
             for attempt in range(8):
                 if self.client is not client or self._stop.is_set():
-                    return  # reconnect happened; new connection restores
+                    return
                 try:
                     client.request("thread/resume", {"threadId": thread_id}, timeout=20)
                     self.joined.add(thread_id)
@@ -275,7 +264,7 @@ class DaemonClient:
                     log.info("join %s attempt %d failed: %s", thread_id[:8], attempt + 1, e)
                     if self._stop.is_set():
                         return
-                    time.sleep(2)  # rollout file may not exist yet (~2s after thread start)
+                    time.sleep(2)
         finally:
             with self._attempts_lock:
                 self._join_attempts.discard(thread_id)
@@ -291,7 +280,6 @@ class DaemonClient:
         finally:
             conn.close()
 
-    # ------------------------------------------------------------------
     def note_thread(self, thread_id, cwd=None, name=None):
         """Learn a thread out-of-band (codex_notify carries its id) and join it
         by explicit id. thread/list + connect-time status dump only cover
@@ -323,16 +311,12 @@ class DaemonClient:
         log.info("note_thread: %s cwd=%s", thread_id, cwd)
         self._join_thread(thread_id)
 
-    # Daemon event handling (runs on the WS reader thread: keep it fast)
-    # ------------------------------------------------------------------
 
     def _on_notification(self, method, params, msg):
         params = params or {}
         if method == "thread/status/changed":
             st = params.get("status") or {}
             if st.get("type") == "active":
-                # Global broadcast: covers idle->active (new turn in the TUI)
-                # and waitingOnApproval flags.
                 self._join_thread(params.get("threadId"))
         elif method == "thread/started":
             th = params.get("thread") or {}
@@ -347,8 +331,6 @@ class DaemonClient:
 
     def _on_server_request(self, method, params, msg):
         if method not in APPROVAL_METHODS:
-            # Unknown server request: answer with cancel/empty to avoid
-            # hanging the turn, and log it.
             log.warning("unhandled server request %s id=%s", method, msg.get("id"))
             self.client.respond(msg.get("id"), {"decision": "cancel"})
             return
@@ -359,9 +341,6 @@ class DaemonClient:
             name="store-approval",
         ).start()
 
-    # ------------------------------------------------------------------
-    # Approval storage / lifecycle
-    # ------------------------------------------------------------------
 
     def _store_approval(self, method, p, msg):
         request_id = msg.get("id")
@@ -417,7 +396,6 @@ class DaemonClient:
             approval_id, thread_id, kind, (command or "")[:120],
         )
 
-        # Delay push: only notify watch if still pending after 60s
         _timer = threading.Timer(
             APPROVAL_PUSH_DELAY,
             self._delayed_push,
@@ -490,9 +468,6 @@ class DaemonClient:
             conn.commit()
             if cur.rowcount:
                 log.info("APPROVAL resolved thread=%s request_id=%s", thread_id, request_id)
-            # Plan A: a daemon resolution also retires the notify-hook twin row
-            # for the same turn, so a request answered in the terminal/TUI is
-            # never pushed to the watch.
             try:
                 row = conn.execute(
                     "SELECT turn_id FROM approvals WHERE thread_id=? AND request_id=?",
@@ -540,9 +515,6 @@ class DaemonClient:
         finally:
             conn.close()
 
-    # ------------------------------------------------------------------
-    # Decision entry point (called from the HTTP layer)
-    # ------------------------------------------------------------------
 
     def handle_decision(self, approval_id, decision):
         """Send the watch's decision to the daemon. Returns a dict for HTTP."""
@@ -564,8 +536,6 @@ class DaemonClient:
         if row["status"] not in ("pending", "sent"):
             return {"ok": False, "error": "approval already %s" % row["status"]}
 
-        # If this is a notify-hook row (no daemon request id of its own), find the
-        # matching daemon row and answer through it so the tap actually works.
         notify_row = str(row["request_id"]).startswith("notify:")
         respond_row = row
         sibling_id = None
@@ -609,11 +579,6 @@ class DaemonClient:
             finally:
                 conn.close()
             if sib is None:
-                # No live daemon sibling: the approval may already have been
-                # answered in the terminal (or the turn ended) while this
-                # notify row was left pending. Look for a resolved/expired
-                # sibling and retire this stale row so the watch can dismiss
-                # the card ("already handled") instead of failing.
                 done = None
                 conn = _connect_db(self.db_path)
                 try:
@@ -680,9 +645,6 @@ class DaemonClient:
             sibling_id = row["approval_id"]
 
         try:
-            # Daemon server-request id is a JSON integer, but request_id is stored
-            # in a TEXT column (SQLite TEXT affinity coerces it to a string). Echo it
-            # back as an int or the daemon cannot match the response and drops it.
             rid = respond_row["request_id"]
             try:
                 rid = int(rid)
@@ -725,5 +687,4 @@ class DaemonClient:
         }
 
 
-# Module-level singleton (set by server.py at startup).
 INSTANCE = None

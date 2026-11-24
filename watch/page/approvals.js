@@ -29,23 +29,6 @@ import {
   ageText
 } from '../common/format'
 
-// ============================================================
-// Codex Watch - Approvals
-//
-// Pending approval queue. Focus a card and select to open a
-// DECISION overlay with APPROVE / REJECT / CANCEL. Refreshes
-// every 15s while visible and right after each decision.
-// Resolved/expired approvals show in a RECENT section.
-//
-// Touch (v1.1.2): cards are BUTTON widgets (click_func) —
-// the only tappable surface verified on this firmware —
-// with pass-through texts. Focus frames sit BELOW the card
-// in Z-order and are color-driven, so they never block
-// touch or hide.
-//
-// Data (v1.1.1): requests carry an explicit 15s timeout and
-// fast retries (3s/6s) after a failure.
-// ============================================================
 
 const TAG = '[Codex Watch Approvals]'
 
@@ -57,7 +40,6 @@ const OVERLAY_CLOSE_MS = 2500
 const REQUEST_TIMEOUT = 15000
 const FAST_RETRY_DELAYS_MS = [3000, 6000]
 
-// Pending card geometry
 const CARD_X = 52
 const CARD_W = 376
 const CARD_H = 88
@@ -85,7 +67,7 @@ Page(
       this.fastRetryTimer = null
       this.fastRetryAt = 0
       this.lastLoadAt = 0
-      this.selected = 0 // back/sync button focus
+      this.selected = 0
       this.destroyed = false
 
       console.log(TAG + ' onInit')
@@ -148,9 +130,6 @@ Page(
       )
     },
 
-    // ----------------------------------------------------------
-    // Text updates
-    // ----------------------------------------------------------
 
     setWidgetText(textWidget, text, color) {
       try {
@@ -167,16 +146,12 @@ Page(
       }
     },
 
-    // ----------------------------------------------------------
-    // List rendering
-    // ----------------------------------------------------------
 
     clearList() {
       this.listWidgets.forEach((w) => {
         try {
           deleteWidget(w)
         } catch (error) {
-          // ignore
         }
       })
 
@@ -193,12 +168,6 @@ Page(
         .forEach((approval, i) => {
           const y = FIRST_CARD_Y + i * (CARD_H + CARD_GAP)
 
-          // Z-order: focus frame first (below), then the
-          // BUTTON card, then pass-through texts on top.
-          // The frame is color-driven (background = hidden),
-          // so it never relies on setEnable for visibility
-          // and being below the card it can never block the
-          // card's touch.
           const frame = createWidget(widget.STROKE_RECT, {
             x: px(CARD_X - 5),
             y: px(y - 5),
@@ -209,8 +178,6 @@ Page(
             color: COLORS.background
           })
 
-          // BUTTON is the only widget that fires click_func on
-          // this firmware (verified v1.1.2).
           const card = createWidget(widget.BUTTON, {
             x: px(CARD_X),
             y: px(y),
@@ -253,7 +220,6 @@ Page(
           this.pendingItems.push({ approval, frame })
         })
 
-      // "+N MORE" indicator
       if (this.actionable.length > MAX_PENDING_CARDS) {
         const y =
           FIRST_CARD_Y + MAX_PENDING_CARDS * (CARD_H + CARD_GAP) -
@@ -269,7 +235,6 @@ Page(
         )
       }
 
-      // Sent (decision in flight)
       if (this.sent.length > 0) {
         this.listWidgets.push(
           addText(
@@ -280,7 +245,6 @@ Page(
         )
       }
 
-      // Recent (resolved/expired)
       if (this.recent.length === 0) {
         this.setWidgetText(this.recentText, 'No recent decisions.')
       } else {
@@ -320,9 +284,6 @@ Page(
       this.updateListFocus()
     },
 
-    // ----------------------------------------------------------
-    // Decision overlay
-    // ----------------------------------------------------------
 
     openOverlay(approval) {
       if (this.overlay) {
@@ -412,7 +373,7 @@ Page(
         approval,
         widgets: [card, title, command, project, status],
         buttons,
-        selected: approval.actionable === false ? 0 : 2, // safe default
+        selected: approval.actionable === false ? 0 : 2,
         busy: false,
         closeTimer: null
       }
@@ -444,12 +405,9 @@ Page(
           try {
             deleteWidget(w)
           } catch (error) {
-            // ignore
           }
         })
 
-        // Buttons live outside `widgets`; delete them too or they
-        // stay on screen as stale tap targets after close.
         overlay.buttons.forEach((item) => {
           const b = item.button
 
@@ -475,14 +433,11 @@ Page(
           try {
             deleteWidget(b.focusFrame)
           } catch (error) {
-            // ignore
           }
         })
 
         self.overlay = null
 
-        // Restore the pending/recent list. The 15s refresh and
-        // onResume keep the data current from here.
         self.renderList()
       }
 
@@ -523,7 +478,6 @@ Page(
         return false
       }
 
-      // Hide the recent section while the overlay is open.
       this.recentLabel.setProperty(
         prop.MORE, { color: COLORS.background }
       )
@@ -677,9 +631,6 @@ Page(
       }, OVERLAY_CLOSE_MS)
     },
 
-    // ----------------------------------------------------------
-    // Data
-    // ----------------------------------------------------------
 
     async load(options) {
       if (this.destroyed || this.loading) {
@@ -738,7 +689,6 @@ Page(
           )
           .slice(0, 2)
 
-        // A decision resolved while the overlay is open: close it.
         if (this.overlay) {
           const stillPending = this.actionable.some(
             (a) => a.approval_id ===
@@ -780,8 +730,6 @@ Page(
       }
     },
 
-    // Fast retries after a failure so the page recovers in
-    // seconds instead of waiting for the 15s refresh tick.
     scheduleFastRetry() {
       if (this.fastRetryTimer) {
         return
@@ -805,9 +753,6 @@ Page(
       }, delay)
     },
 
-    // ----------------------------------------------------------
-    // Keys
-    // ----------------------------------------------------------
 
     handleKey(action) {
       if (this.overlay) {
@@ -854,15 +799,10 @@ Page(
       return false
     },
 
-    // ----------------------------------------------------------
-    // Lifecycle
-    // ----------------------------------------------------------
 
     onResume() {
       console.log(TAG + ' resumed')
 
-      // A back navigation destroys the previous page's keypad
-      // handler; re-claim it for this page.
       try {
         activateKeypad((action) => this.handleKey(action))
       } catch (error) {
@@ -903,7 +843,6 @@ Page(
           try {
             deleteWidget(w)
           } catch (error) {
-            // ignore
           }
         })
 
@@ -917,12 +856,10 @@ Page(
           try {
             deleteWidget(b.button)
           } catch (error) {
-            // ignore
           }
           try {
             deleteWidget(b.focusFrame)
           } catch (error) {
-            // ignore
           }
         })
 
@@ -931,7 +868,6 @@ Page(
 
       this.clearList()
 
-      // Sticky keypad: see inbox.js onDestroy comment.
     }
   })
 )

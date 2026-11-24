@@ -58,9 +58,6 @@ logging.basicConfig(
 log = logging.getLogger("codex-watch")
 
 
-# --------------------------------------------------
-# Database
-# --------------------------------------------------
 
 def connect_db():
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -149,15 +146,11 @@ def init_db():
         );
     """)
 
-    # Plan A: notify-hook approvals carry the Codex transcript path so the
-    # bridge can watch it for an in-TUI answer and drop the pending push.
     try:
         conn.execute("ALTER TABLE approvals ADD COLUMN transcript_path TEXT")
     except sqlite3.OperationalError:
-        pass  # column already present
+        pass
 
-    # Legacy completion events had no expiry and could flood a watch after a
-    # long disconnect. Keep the records, but retire that existing backlog.
     conn.execute("""
         UPDATE events
         SET expires_at = created_at
@@ -171,9 +164,6 @@ def init_db():
     log.info("Database initialized: %s", DB_PATH)
 
 
-# --------------------------------------------------
-# Event storage (shared by the HTTP path and the daemon client)
-# --------------------------------------------------
 
 def store_event(data):
     """Validate and insert an event. Returns (event_id, created).
@@ -259,9 +249,6 @@ def store_event(data):
     return event_id, created
 
 
-# --------------------------------------------------
-# Out-of-band approvals (Codex notify hook)
-# --------------------------------------------------
 
 NOTIFY_PUSH_DELAY = 60
 
@@ -334,18 +321,12 @@ def store_notify_approval(data):
         approval_id, thread_id, kind, (command or "")[:120], fresh,
     )
 
-    # Join the thread so the daemon replays the still-pending approval
-    # server-request to us. Without this, no daemon sibling row is ever
-    # created and watch decisions fail with 409.
     try:
         if daemon_client.INSTANCE is not None and thread_id:
             daemon_client.INSTANCE.note_thread(thread_id, cwd=cwd)
     except Exception as exc:
         log.warning("note_thread in store_notify_approval failed: %r", exc)
 
-    # Delay the push: only notify the watch if the approval is still pending
-    # after NOTIFY_PUSH_DELAY seconds (i.e. the user has not answered in the
-    # Codex terminal). Mirrors the daemon path's grace period.
     if fresh:
         _timer = threading.Timer(
             NOTIFY_PUSH_DELAY,
@@ -355,8 +336,6 @@ def store_notify_approval(data):
         _timer.daemon = True
         _timer.start()
 
-        # Plan A: watch the Codex transcript for an in-TUI answer so a
-        # request the user already handled in the terminal is never pushed.
         if transcript_path:
             _w = threading.Thread(
                 target=_transcript_watcher,
@@ -369,9 +348,6 @@ def store_notify_approval(data):
     return {"ok": True, "approval_id": approval_id, "event_id": "appr-" + approval_id}
 
 
-# Plan A: transcript signals that mean the pending approval was already
-# answered in the TUI. Any of these appearing AFTER the hook fired means the
-# user handled it locally, so the watch push should be cancelled.
 _TUI_ANSWER_ITEM_TYPES = ("CommandExecution", "McpToolCall")
 _TUI_ANSWER_EVENT_TYPES = ("turn_aborted", "task_complete")
 _TRANSCRIPT_WATCH_INTERVAL = 2
@@ -459,8 +435,6 @@ def _transcript_watcher(approval_id, transcript_path):
                         _resolve_notify_by_transcript(approval_id, signal)
                         return
         elif size is not None and size < last_size:
-            # Rotated/truncated: only watch new appends going forward so we
-            # never match historical signals from a previous file.
             last_size = size
         time.sleep(_TRANSCRIPT_WATCH_INTERVAL)
 
@@ -565,9 +539,6 @@ def resolve_thread_approvals(thread_id):
         conn.close()
 
 
-# --------------------------------------------------
-# HTTP helpers
-# --------------------------------------------------
 
 def json_bytes(data):
     return json.dumps(
@@ -661,9 +632,6 @@ class Handler(BaseHTTPRequestHandler):
 
         return data
 
-    # --------------------------------------------------
-    # GET
-    # --------------------------------------------------
 
     def do_GET(self):
 
@@ -896,10 +864,6 @@ class Handler(BaseHTTPRequestHandler):
 
             conn = connect_db()
 
-            # Newest-first history for the watch inbox.
-            # Delivered events always remain visible; undelivered events
-            # are only shown while they have not expired (the same rule
-            # /v1/events uses for delivery).
             rows = conn.execute("""
                 SELECT
                     e.*,
@@ -964,9 +928,6 @@ class Handler(BaseHTTPRequestHandler):
             "error": "not found"
         })
 
-    # --------------------------------------------------
-    # POST
-    # --------------------------------------------------
 
     def do_POST(self):
 
@@ -987,9 +948,6 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # ----------------------------------------------
-        # POST /v1/events
-        # ----------------------------------------------
 
         if parsed.path == "/v1/events":
 
@@ -1037,9 +995,6 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # ----------------------------------------------
-        # POST /v1/approvals  (notify hook, out-of-band)
-        # ----------------------------------------------
 
         if parsed.path == "/v1/approvals":
 
@@ -1059,9 +1014,6 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # ----------------------------------------------
-        # POST /v1/approvals/<id>/decision
-        # ----------------------------------------------
 
         parts = parsed.path.split("/")
 
@@ -1108,9 +1060,6 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # ----------------------------------------------
-        # POST /v1/ack
-        # ----------------------------------------------
 
         if parsed.path == "/v1/ack":
 
@@ -1230,9 +1179,6 @@ class Handler(BaseHTTPRequestHandler):
         })
 
 
-# --------------------------------------------------
-# Main
-# --------------------------------------------------
 
 def main():
 
