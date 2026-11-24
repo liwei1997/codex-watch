@@ -185,6 +185,9 @@ class DaemonClient:
     def _on_server_request(self, method, params, msg):
         if method not in APPROVAL_METHODS:
             log.warning("unsupported server request %s", method)
+            client = self.client
+            if client:
+                client.respond(msg.get("id"), {"decision": "cancel"})
             return
         request_id = msg.get("id")
         thread_id = (params or {}).get("threadId")

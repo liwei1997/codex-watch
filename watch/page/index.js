@@ -4,7 +4,6 @@ import { px } from '@zos/utils'
 import { push } from '@zos/router'
 import { requestPermission } from '@zos/app'
 import { start } from '@zos/app-service'
-import { createSysTimer, stopTimer } from '@zos/timer'
 import { COLORS, drawBackground, addText } from './ui'
 import { activateKeypad } from './keypad'
 
@@ -121,6 +120,5 @@ Page(BasePage({
   onDestroy() {
     this.destroyed = true
     if (this.refreshTimer) clearInterval(this.refreshTimer)
-    try { stopTimer(this.refreshTimer) } catch (error) {}
   }
 }))
