@@ -11,6 +11,9 @@ from wsclient import WSClient
 
 
 log = logging.getLogger("codex-watch.daemon")
+
+# Shared daemon client, initialized by server.main().
+INSTANCE = None
 DAEMON_SOCK = os.environ.get(
     "CODEX_DAEMON_SOCK",
     "/home/liwei/.codex/app-server-control/app-server-control.sock",
