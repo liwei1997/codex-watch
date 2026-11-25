@@ -11,6 +11,8 @@ from wsclient import WSClient
 
 
 log = logging.getLogger("codex-watch.daemon")
+
+INSTANCE = None
 DAEMON_SOCK = os.environ.get(
     "CODEX_DAEMON_SOCK",
     "/home/liwei/.codex/app-server-control/app-server-control.sock",
@@ -32,11 +34,13 @@ class DaemonClient:
         self,
         notification_sink=None,
         turn_started_sink=None,
+        turn_completed_sink=None,
         notification_cancel_sink=None,
         sock_path=DAEMON_SOCK,
     ):
         self.notification_sink = notification_sink
         self.turn_started_sink = turn_started_sink
+        self.turn_completed_sink = turn_completed_sink
         self.notification_cancel_sink = notification_cancel_sink
         self.sock_path = sock_path
         self.client = None
@@ -49,6 +53,8 @@ class DaemonClient:
         self.closed = threading.Event()
         self.thread = None
         self.joining = set()
+        self.activity = {}
+        self.last_completed = {}
 
     def start(self):
         self.thread = threading.Thread(target=self._run_forever, name="codex-daemon-client", daemon=True)
@@ -84,11 +90,12 @@ class DaemonClient:
             self.client = client
             self.connected = False
             self.joined.clear()
+            self.activity.clear()
         try:
             client.request("initialize", {"clientInfo": {
                 "name": "codex-watch-bridge",
                 "title": "Codex Watch Bridge",
-                "version": "0.3.0",
+                "version": "0.4.1",
             }}, timeout=20)
             client.notify("initialized")
             self.connected = True
@@ -102,27 +109,54 @@ class DaemonClient:
                     self.joined.clear()
             client.close()
 
+    def _loaded_thread_ids(self, client):
+        loaded = set()
+        cursor = None
+        while True:
+            params = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            result = client.request("thread/loaded/list", params, timeout=30) or {}
+            loaded.update(result.get("data") or [])
+            cursor = result.get("nextCursor")
+            if not cursor:
+                return loaded
+
     def _restore_threads(self):
-        result = self.client.request(
+        client = self.client
+        result = client.request(
             "thread/list",
             {"limit": 100, "sourceKinds": ALL_SOURCE_KINDS},
             timeout=30,
         )
+        loaded = self._loaded_thread_ids(client)
         for item in (result or {}).get("data") or []:
             thread_id = item.get("id")
-            if thread_id:
-                self.threads[thread_id] = {
-                    "cwd": item.get("cwd") or "",
-                    "name": item.get("name") or "",
-                }
-                if (item.get("status") or {}).get("type") == "active":
-                    self._join_thread(thread_id)
+            if not thread_id:
+                continue
+            self.note_thread(thread_id, cwd=item.get("cwd"), name=item.get("name"))
+            if thread_id in loaded and (item.get("status") or {}).get("type") == "active":
+                with self.lock:
+                    self.activity.setdefault(thread_id, ("active", time.time(), object()))
+        for thread_id in loaded:
+            self._join_thread(thread_id)
+
+    def _mark_joined(self, thread_id, client=None):
+        if not thread_id:
+            return
+        with self.lock:
+            if client is None or self.client is client:
+                self.joined.add(str(thread_id))
 
     def note_thread(self, thread_id, cwd=None, name=None):
         if not thread_id:
             return
-        self.threads[str(thread_id)] = {"cwd": cwd or "", "name": name or ""}
-        self._join_thread(str(thread_id))
+        thread_id = str(thread_id)
+        current = self.threads.get(thread_id) or {}
+        self.threads[thread_id] = {
+            "cwd": cwd or current.get("cwd") or "",
+            "name": name or current.get("name") or "",
+        }
 
     def _join_thread(self, thread_id):
         if not thread_id or not self.client:
@@ -137,25 +171,125 @@ class DaemonClient:
             daemon=True,
         ).start()
 
+    def _ensure_joined(self, thread_id, client):
+        with self.lock:
+            if thread_id in self.joined:
+                return
+        result = client.request("thread/resume", {
+            "threadId": thread_id,
+            "excludeTurns": True,
+        }, timeout=20)
+        thread = (result or {}).get("thread") or {}
+        self.note_thread(thread_id, cwd=thread.get("cwd"), name=thread.get("name"))
+        self._mark_joined(thread_id, client)
+
     def _join_worker(self, thread_id, client):
         try:
             for attempt in range(8):
                 if self.client is not client or self.stop_event.is_set():
                     return
                 try:
-                    client.request("thread/resume", {"threadId": thread_id}, timeout=20)
-                    with self.lock:
-                        if self.client is client:
-                            self.joined.add(thread_id)
+                    self._ensure_joined(thread_id, client)
                     log.info("joined thread %s", thread_id)
                     return
                 except Exception as exc:
-                    if attempt == 7:
+                    if attempt == 7 or "active writer" in str(exc):
                         log.warning("thread resume failed %s: %s", thread_id, exc)
+                        return
                     self.stop_event.wait(2)
         finally:
             with self.lock:
                 self.joining.discard(thread_id)
+
+    def _set_active(self, thread_id, msg):
+        if not thread_id:
+            return
+        with self.lock:
+            previous = self.activity.get(thread_id)
+            if previous and previous[0] == "active":
+                return
+            started = (msg.get("emittedAtMs") or time.time() * 1000) / 1000
+            self.activity[thread_id] = ("active", started, object())
+            if self.turn_started_sink:
+                self.turn_started_sink(thread_id)
+
+    def _set_idle(self, thread_id):
+        with self.lock:
+            previous = self.activity.get(thread_id)
+            if not previous or previous[0] != "active":
+                return
+            state = ("idle", previous[1], previous[2])
+            self.activity[thread_id] = state
+            client = self.client
+        if client:
+            threading.Thread(
+                target=self._recover_completion,
+                args=(thread_id, client, state),
+                daemon=True,
+            ).start()
+
+    def _recover_completion(self, thread_id, client, state):
+        for attempt in range(5):
+            with self.lock:
+                if self.client is not client or self.activity.get(thread_id) != state:
+                    return
+            try:
+                result = client.request("thread/turns/list", {
+                    "threadId": thread_id,
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "full",
+                }, timeout=10) or {}
+                turns = result.get("data") or []
+                turn = turns[0] if turns else {}
+                completed = turn.get("completedAt")
+                if turn.get("status") == "completed" and completed is not None and completed >= int(state[1]):
+                    with self.lock:
+                        if self.client is client and self.activity.get(thread_id) == state:
+                            self._complete_turn(thread_id, turn)
+                    return
+                if turn.get("status") in ("failed", "interrupted") and completed is not None and completed >= int(state[1]):
+                    return
+            except Exception as exc:
+                log.warning("latest turn lookup failed %s: %s", thread_id, exc)
+            if self.stop_event.wait(1):
+                return
+        log.warning("no recent completed turn found for %s", thread_id)
+
+    def _complete_turn(self, thread_id, turn):
+        turn_id = turn.get("id")
+        if not thread_id or not turn_id:
+            return
+        with self.lock:
+            self._expire_turn(thread_id, turn_id)
+            if not self.turn_completed_sink or turn.get("status", "completed") != "completed":
+                return
+            if self.last_completed.get(thread_id) == turn_id:
+                return
+            state = self.activity.get(thread_id)
+            completed = turn.get("completedAt")
+            if state and completed is not None and completed < int(state[1]):
+                return
+            message = next((
+                str(item.get("text") or "").strip()
+                for item in reversed(turn.get("items") or [])
+                if isinstance(item, dict)
+                and item.get("type") == "agentMessage"
+                and item.get("phase") in (None, "final_answer")
+                and item.get("text")
+            ), "")
+            thread = self.threads.get(thread_id) or {}
+            try:
+                self.turn_completed_sink({
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "cwd": thread.get("cwd") or "",
+                    "message": (message or "Codex turn completed.")[:16000],
+                })
+                self.last_completed[thread_id] = turn_id
+                log.info("completion notification scheduled thread=%s turn=%s", thread_id, turn_id)
+            except Exception:
+                log.exception("completion notification scheduling failed thread=%s turn=%s", thread_id, turn_id)
 
     def _on_notification(self, method, params, msg):
         params = params or {}
@@ -164,21 +298,32 @@ class DaemonClient:
             thread = params.get("thread") or {}
             thread_id = thread.get("id")
             self.note_thread(thread_id, cwd=thread.get("cwd"))
+            self._join_thread(thread_id)
         elif method == "thread/status/changed":
-            if (params.get("status") or {}).get("type") == "active":
+            status = (params.get("status") or {}).get("type")
+            if status == "active":
+                self.note_thread(thread_id)
+                self._set_active(thread_id, msg)
                 self._join_thread(thread_id)
+            elif status == "idle":
+                self._set_idle(thread_id)
+            elif status == "notLoaded":
+                with self.lock:
+                    self.joined.discard(thread_id)
+                    self.activity.pop(thread_id, None)
         elif method == "thread/deleted":
-            self.threads.pop(thread_id, None)
             with self.lock:
+                self.threads.pop(thread_id, None)
                 self.joined.discard(thread_id)
+                self.activity.pop(thread_id, None)
+                self.last_completed.pop(thread_id, None)
+                if self.turn_started_sink:
+                    self.turn_started_sink(thread_id)
         elif method == "turn/started":
-            turn = params.get("turn") or {}
-            if self.turn_started_sink:
-                self.turn_started_sink(thread_id)
+            self._set_active(thread_id, msg)
             self._cancel_thread_approvals(thread_id)
         elif method == "turn/completed":
-            turn = params.get("turn") or {}
-            self._expire_turn(thread_id, turn.get("id"))
+            self._complete_turn(thread_id, params.get("turn") or {})
         elif method == "serverRequest/resolved":
             self._mark_resolved(thread_id, params.get("requestId"))
 
@@ -325,9 +470,9 @@ class DaemonClient:
         client = self.client
         if not client or client.closed:
             return {"ok": False, "error": "not connected to codex daemon"}
-        if thread_id not in self.joined:
-            return {"ok": False, "error": "thread is not joined"}
         try:
+            if thread_id not in self._loaded_thread_ids(client):
+                self._ensure_joined(thread_id, client)
             result = client.request("turn/start", {
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": text}],
