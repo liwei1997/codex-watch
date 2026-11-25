@@ -30,36 +30,54 @@ async function request(service, path, method = 'get', payload) {
 }
 
 AppSideService(BaseSideService({
+  state: { startedAt: 0, requestCount: 0 },
+
   onInit() {
+    this.state.startedAt = Date.now()
+    this.state.requestCount = 0
     console.log('[Codex Watch] Side Service initialized')
   },
 
+  onRun() {
+    console.log('[Codex Watch] Side Service running')
+  },
+
   async onRequest(req, res) {
-    const params = req.params || {}
+    const method = req && req.method
+    const params = req && req.params || {}
+    const startedAt = Date.now()
+    this.state.requestCount += 1
+    console.log('[Codex Watch] Side request ' + method + ' #' + this.state.requestCount)
     try {
-      if (req.method === 'bridge.version') {
-        res(null, { ok: true, js: '120-20261124', methods: [
-          'bridge.version', 'bridge.poll', 'bridge.approval.list',
-          'bridge.approval.decision', 'bridge.thread.reply'
-        ] })
+      if (method === 'bridge.version') {
+        res(null, {
+          ok: true,
+          js: '121-20261125',
+          service: 'ready',
+          uptime_ms: Date.now() - this.state.startedAt,
+          request_count: this.state.requestCount,
+          methods: [
+            'bridge.version', 'bridge.poll', 'bridge.approval.list',
+            'bridge.approval.decision', 'bridge.thread.reply'
+          ]
+        })
         return
       }
       if (BASE_URL.includes('YOUR_UBUNTU') || BRIDGE_TOKEN.startsWith('PASTE_')) {
         throw new Error('Configure BRIDGE_URL and BRIDGE_TOKEN')
       }
-      if (req.method === 'bridge.poll') {
+      if (method === 'bridge.poll') {
         const limit = Math.max(1, Math.min(50, Number(params.limit) || 20))
-        const data = await request(this, '/v1/notifications?limit=' + limit)
-        res(null, data)
+        res(null, await request(this, '/v1/notifications?limit=' + limit))
         return
       }
-      if (req.method === 'bridge.approval.list') {
+      if (method === 'bridge.approval.list') {
         const status = encodeURIComponent(params.status || 'pending')
         const limit = Math.max(1, Math.min(50, Number(params.limit) || 20))
         res(null, await request(this, '/v1/approvals?status=' + status + '&limit=' + limit))
         return
       }
-      if (req.method === 'bridge.approval.decision') {
+      if (method === 'bridge.approval.decision') {
         const id = String(params.approval_id || '')
         const decision = String(params.decision || '').toLowerCase()
         if (!id || !['accept', 'decline'].includes(decision)) {
@@ -73,14 +91,14 @@ AppSideService(BaseSideService({
         ))
         return
       }
-      if (req.method === 'bridge.notification.ack') {
+      if (method === 'bridge.notification.ack') {
         if (!params.event_id) throw new Error('event_id required')
         res(null, await request(this, '/v1/notifications/ack', 'post', {
           event_id: String(params.event_id)
         }))
         return
       }
-      if (req.method === 'bridge.thread.reply') {
+      if (method === 'bridge.thread.reply') {
         const threadId = String(params.thread_id || '')
         const text = String(params.text || '').trim()
         if (!threadId || !text) throw new Error('thread_id and text required')
@@ -90,11 +108,17 @@ AppSideService(BaseSideService({
         }))
         return
       }
-      res('Unknown method: ' + req.method)
+      res('Unknown method: ' + method)
     } catch (error) {
       console.error('[Codex Watch] Request failed: ' + String(error))
       res(null, { ok: false, error: error.message || String(error) })
+    } finally {
+      console.log('[Codex Watch] Side request ' + method + ' finished in ' + (Date.now() - startedAt) + 'ms')
     }
+  },
+
+  onDestroy() {
+    console.log('[Codex Watch] Side Service destroyed after ' + this.state.requestCount + ' requests')
   },
 
   onCall(data) {
