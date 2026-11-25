@@ -16,7 +16,7 @@ import daemon_client
 HOST = os.getenv("CODEX_WATCH_HOST", "127.0.0.1")
 PORT = int(os.getenv("CODEX_WATCH_PORT", "8765"))
 TOKEN = os.getenv("CODEX_WATCH_TOKEN", "")
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 MAX_BODY_SIZE = 1024 * 1024
 MAX_NOTIFICATIONS = 50
 NOTIFY_PUSH_DELAY = int(os.getenv("CODEX_WATCH_NOTIFY_DELAY", "60"))
