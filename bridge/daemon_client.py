@@ -32,11 +32,13 @@ class DaemonClient:
         self,
         notification_sink=None,
         turn_started_sink=None,
+        turn_completed_sink=None,
         notification_cancel_sink=None,
         sock_path=DAEMON_SOCK,
     ):
         self.notification_sink = notification_sink
         self.turn_started_sink = turn_started_sink
+        self.turn_completed_sink = turn_completed_sink
         self.notification_cancel_sink = notification_cancel_sink
         self.sock_path = sock_path
         self.client = None
@@ -88,7 +90,7 @@ class DaemonClient:
             client.request("initialize", {"clientInfo": {
                 "name": "codex-watch-bridge",
                 "title": "Codex Watch Bridge",
-                "version": "0.3.0",
+                "version": "0.4.0",
             }}, timeout=20)
             client.notify("initialized")
             self.connected = True
@@ -102,27 +104,62 @@ class DaemonClient:
                     self.joined.clear()
             client.close()
 
+    def _loaded_thread_ids(self, client):
+        loaded = set()
+        cursor = None
+        while True:
+            params = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            result = client.request("thread/loaded/list", params, timeout=30) or {}
+            loaded.update(result.get("data") or [])
+            cursor = result.get("nextCursor")
+            if not cursor:
+                return loaded
+
     def _restore_threads(self):
-        result = self.client.request(
+        client = self.client
+        result = client.request(
             "thread/list",
             {"limit": 100, "sourceKinds": ALL_SOURCE_KINDS},
             timeout=30,
         )
+        try:
+            loaded = self._loaded_thread_ids(client)
+        except Exception as exc:
+            log.warning("loaded thread lookup failed: %s", exc)
+            loaded = set()
         for item in (result or {}).get("data") or []:
             thread_id = item.get("id")
-            if thread_id:
-                self.threads[thread_id] = {
-                    "cwd": item.get("cwd") or "",
-                    "name": item.get("name") or "",
-                }
-                if (item.get("status") or {}).get("type") == "active":
-                    self._join_thread(thread_id)
+            if not thread_id:
+                continue
+            self.threads[thread_id] = {
+                "cwd": item.get("cwd") or "",
+                "name": item.get("name") or "",
+            }
+            if thread_id in loaded:
+                self._mark_joined(thread_id, client)
+            elif (item.get("status") or {}).get("type") == "active":
+                self._join_thread(thread_id)
 
-    def note_thread(self, thread_id, cwd=None, name=None):
+    def _mark_joined(self, thread_id, client=None):
         if not thread_id:
             return
-        self.threads[str(thread_id)] = {"cwd": cwd or "", "name": name or ""}
-        self._join_thread(str(thread_id))
+        with self.lock:
+            if client is None or self.client is client:
+                self.joined.add(str(thread_id))
+
+    def note_thread(self, thread_id, cwd=None, name=None, loaded=False):
+        if not thread_id:
+            return
+        thread_id = str(thread_id)
+        current = self.threads.get(thread_id) or {}
+        self.threads[thread_id] = {
+            "cwd": cwd or current.get("cwd") or "",
+            "name": name or current.get("name") or "",
+        }
+        if loaded:
+            self._mark_joined(thread_id)
 
     def _join_thread(self, thread_id):
         if not thread_id or not self.client:
@@ -137,16 +174,29 @@ class DaemonClient:
             daemon=True,
         ).start()
 
+    def _ensure_joined(self, thread_id, client):
+        with self.lock:
+            if thread_id in self.joined:
+                return
+        loaded = self._loaded_thread_ids(client)
+        if thread_id in loaded:
+            self._mark_joined(thread_id, client)
+            return
+        try:
+            client.request("thread/resume", {"threadId": thread_id}, timeout=20)
+        except Exception:
+            loaded = self._loaded_thread_ids(client)
+            if thread_id not in loaded:
+                raise
+        self._mark_joined(thread_id, client)
+
     def _join_worker(self, thread_id, client):
         try:
             for attempt in range(8):
                 if self.client is not client or self.stop_event.is_set():
                     return
                 try:
-                    client.request("thread/resume", {"threadId": thread_id}, timeout=20)
-                    with self.lock:
-                        if self.client is client:
-                            self.joined.add(thread_id)
+                    self._ensure_joined(thread_id, client)
                     log.info("joined thread %s", thread_id)
                     return
                 except Exception as exc:
@@ -163,10 +213,10 @@ class DaemonClient:
         if method == "thread/started":
             thread = params.get("thread") or {}
             thread_id = thread.get("id")
-            self.note_thread(thread_id, cwd=thread.get("cwd"))
+            self.note_thread(thread_id, cwd=thread.get("cwd"), loaded=True)
         elif method == "thread/status/changed":
             if (params.get("status") or {}).get("type") == "active":
-                self._join_thread(thread_id)
+                self.note_thread(thread_id, loaded=True)
         elif method == "thread/deleted":
             self.threads.pop(thread_id, None)
             with self.lock:
@@ -178,7 +228,33 @@ class DaemonClient:
             self._cancel_thread_approvals(thread_id)
         elif method == "turn/completed":
             turn = params.get("turn") or {}
-            self._expire_turn(thread_id, turn.get("id"))
+            turn_id = turn.get("id")
+            self._expire_turn(thread_id, turn_id)
+            if self.turn_completed_sink and thread_id and turn_id:
+                thread = self.threads.get(thread_id) or {}
+                items = turn.get("items") or []
+                message = ""
+                for item in reversed(items):
+                    if isinstance(item, dict) and item.get("type") == "agentMessage":
+                        message = str(item.get("text") or "").strip()
+                        if message:
+                            break
+                try:
+                    result = self.turn_completed_sink({
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "cwd": thread.get("cwd") or "",
+                        "message": message or "Codex turn completed.",
+                    })
+                    log.info(
+                        "completion notification scheduled thread=%s turn=%s result=%s",
+                        thread_id, turn_id, result,
+                    )
+                except Exception:
+                    log.exception(
+                        "completion notification scheduling failed thread=%s turn=%s",
+                        thread_id, turn_id,
+                    )
         elif method == "serverRequest/resolved":
             self._mark_resolved(thread_id, params.get("requestId"))
 
@@ -224,7 +300,7 @@ class DaemonClient:
             ):
                 return
             self.approvals[approval_id] = entry
-        self.note_thread(thread_id, cwd=entry["cwd"])
+        self.note_thread(thread_id, cwd=entry["cwd"], loaded=True)
         timer.start()
 
     def _publish_approval(self, approval_id):
@@ -325,9 +401,8 @@ class DaemonClient:
         client = self.client
         if not client or client.closed:
             return {"ok": False, "error": "not connected to codex daemon"}
-        if thread_id not in self.joined:
-            return {"ok": False, "error": "thread is not joined"}
         try:
+            self._ensure_joined(thread_id, client)
             result = client.request("turn/start", {
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": text}],

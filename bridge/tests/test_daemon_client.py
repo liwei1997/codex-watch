@@ -19,6 +19,42 @@ class FakeConnection:
         self.responses.append((request_id, response))
 
 
+class DaemonCompletionNotificationTest(unittest.TestCase):
+    def test_turn_completed_schedules_notification_from_app_server_event(self):
+        sink = Mock(return_value={"ok": True, "event_id": "event-1"})
+        client = DaemonClient(turn_completed_sink=sink)
+        thread_id = "thread-1"
+        client.threads[thread_id] = {"cwd": "/workspace/project", "name": "project"}
+
+        client._on_notification("turn/completed", {
+            "threadId": thread_id,
+            "turn": {
+                "id": "turn-1",
+                "items": [
+                    {"type": "reasoning", "text": "not sent"},
+                    {"type": "agentMessage", "phase": "final_answer", "text": "Task finished."},
+                ],
+            },
+        }, {})
+
+        sink.assert_called_once_with({
+            "thread_id": thread_id,
+            "turn_id": "turn-1",
+            "cwd": "/workspace/project",
+            "message": "Task finished.",
+        })
+
+    def test_turn_completed_without_ids_does_not_schedule(self):
+        sink = Mock()
+        client = DaemonClient(turn_completed_sink=sink)
+
+        client._on_notification("turn/completed", {
+            "turn": {"items": []},
+        }, {})
+
+        sink.assert_not_called()
+
+
 class DaemonDecisionTest(unittest.TestCase):
     def setUp(self):
         self.client = DaemonClient()

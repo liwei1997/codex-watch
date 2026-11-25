@@ -85,6 +85,19 @@ class BridgeHttpApiTest(unittest.TestCase):
         self.assertTrue(result['removed'])
         self.assertEqual(server.notification_list(20), [])
 
+    def test_legacy_completion_and_thread_observe_routes_are_removed(self):
+        status, _ = self.request(
+            'POST', '/v1/completions',
+            {'thread_id': 'thread-1', 'turn_id': 'turn-1'},
+        )
+        self.assertEqual(status, 404)
+
+        status, _ = self.request(
+            'POST', '/v1/threads/observe',
+            {'thread_id': 'thread-1', 'cwd': '/workspace/project'},
+        )
+        self.assertEqual(status, 404)
+
     def test_approval_decision_route_dispatches_to_daemon(self):
         status, result = self.request(
             'POST',

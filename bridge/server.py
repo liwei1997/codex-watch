@@ -16,7 +16,7 @@ import daemon_client
 HOST = os.getenv("CODEX_WATCH_HOST", "127.0.0.1")
 PORT = int(os.getenv("CODEX_WATCH_PORT", "8765"))
 TOKEN = os.getenv("CODEX_WATCH_TOKEN", "")
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MAX_BODY_SIZE = 1024 * 1024
 MAX_NOTIFICATIONS = 50
 NOTIFY_PUSH_DELAY = int(os.getenv("CODEX_WATCH_NOTIFY_DELAY", "60"))
@@ -108,31 +108,35 @@ def schedule_completion(data):
         },
         "created_at": int(time.time()),
     }
-    timer = threading.Timer(
-        NOTIFY_PUSH_DELAY,
-        _publish_completion,
-        args=(thread_id, turn_id),
-    )
-    timer.daemon = True
     with STATE_LOCK:
+        if event_id in notifications:
+            return {"ok": True, "event_id": event_id, "delay": NOTIFY_PUSH_DELAY, "queued": True}
         previous = pending_completions.get(thread_id)
+        if previous and previous["turn_id"] == turn_id:
+            if message and message != "Codex turn completed.":
+                previous["notification"]["body"] = message
+            return {"ok": True, "event_id": event_id, "delay": NOTIFY_PUSH_DELAY, "duplicate": True}
         if previous:
             previous["timer"].cancel()
+        stale = [
+            queued_id for queued_id, queued in notifications.items()
+            if queued.get("type") == "task_completed"
+            and (queued.get("payload") or {}).get("thread_id") == thread_id
+        ]
+        for queued_id in stale:
+            notifications.pop(queued_id, None)
+        timer = threading.Timer(
+            NOTIFY_PUSH_DELAY,
+            _publish_completion,
+            args=(thread_id, turn_id),
+        )
+        timer.daemon = True
         pending_completions[thread_id] = {
             "turn_id": turn_id,
             "timer": timer,
             "notification": item,
         }
-        stale = [
-            event_id for event_id, queued in notifications.items()
-            if queued.get("type") == "task_completed"
-            and (queued.get("payload") or {}).get("thread_id") == thread_id
-        ]
-        for event_id in stale:
-            notifications.pop(event_id, None)
-    timer.start()
-    if daemon_client.INSTANCE is not None:
-        daemon_client.INSTANCE.note_thread(thread_id, cwd=cwd)
+        timer.start()
     log.info(
         "completion scheduled thread=%s turn=%s delay=%ss",
         thread_id, turn_id, NOTIFY_PUSH_DELAY
@@ -244,21 +248,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
         try:
-            if path == "/v1/completions":
-                result = schedule_completion(data)
-                self.send_json(202, result)
-                return
-            if path == "/v1/threads/observe":
-                thread_id = str(data.get("thread_id") or "").strip()
-                if not thread_id:
-                    raise ValueError("thread_id required")
-                if daemon_client.INSTANCE:
-                    daemon_client.INSTANCE.note_thread(
-                        thread_id,
-                        cwd=str(data.get("cwd") or ""),
-                    )
-                self.send_json(200, {"ok": True, "thread_id": thread_id})
-                return
             if path == "/v1/notifications/ack":
                 event_id = str(data.get("event_id") or "").strip()
                 if not event_id:
@@ -305,6 +294,7 @@ def main():
     daemon_client.INSTANCE = daemon_client.DaemonClient(
         notification_sink=queue_notification,
         turn_started_sink=cancel_completion,
+        turn_completed_sink=schedule_completion,
         notification_cancel_sink=cancel_approval_notification,
     )
     daemon_client.INSTANCE.start()
