@@ -1,35 +1,64 @@
 import { BasePage } from '@zeppos/zml/base-page'
+import { connectStatus } from '@zos/ble'
 import { createWidget, widget } from '@zos/ui'
 import { px } from '@zos/utils'
 import { push } from '@zos/router'
-import { requestPermission } from '@zos/app'
+import { queryPermission, requestPermission } from '@zos/app'
 import { start } from '@zos/app-service'
 import { COLORS, drawBackground, addText } from './ui'
 import { activateKeypad } from './keypad'
+import { isBleConnected, phoneConnectionLabel } from '../common/phone_link'
 
 const TAG = '[Codex Watch]'
 const BACKGROUND_SERVICE = 'app-service/codex_background'
-let backgroundStartState = 'idle'
+let backgroundStartPending = false
 
 function launchBackgroundService() {
-  if (backgroundStartState !== 'idle') return
-  backgroundStartState = 'starting'
+  if (backgroundStartPending) return
+  backgroundStartPending = true
   try {
     const result = start({
       file: BACKGROUND_SERVICE,
       reload: true,
       complete_func: status => {
-        backgroundStartState = status && status.result === true ? 'started' : 'idle'
-        console.log(TAG + ' Background service ' + backgroundStartState)
+        backgroundStartPending = false
+        console.log(TAG + ' Background service start result: ' + JSON.stringify(status))
       }
     })
     if (result !== 0) {
-      backgroundStartState = 'idle'
+      backgroundStartPending = false
       console.log(TAG + ' Background service start rejected: ' + result)
     }
   } catch (error) {
-    backgroundStartState = 'idle'
+    backgroundStartPending = false
     console.log(TAG + ' Background service start failed: ' + String(error))
+  }
+}
+
+function startBackgroundService() {
+  try {
+    const permissions = queryPermission({
+      permissions: ['device:os.bg_service']
+    })
+    if (permissions && permissions[0] === 2) {
+      launchBackgroundService()
+      return
+    }
+    if (permissions && permissions[0] === 0) {
+      const result = requestPermission({
+        permissions: ['device:os.bg_service'],
+        callback: granted => {
+          if (Array.isArray(granted) && granted[0] === 2) launchBackgroundService()
+          else console.log(TAG + ' Background permission denied: ' + JSON.stringify(granted))
+        }
+      })
+      if (result === 2) launchBackgroundService()
+      else if (result === 1) console.log(TAG + ' Background permission cannot be requested')
+      return
+    }
+    console.log(TAG + ' Background permission unavailable: ' + JSON.stringify(permissions))
+  } catch (error) {
+    console.log(TAG + ' Background permission check failed: ' + String(error))
   }
 }
 
@@ -46,7 +75,7 @@ Page(BasePage({
     drawBackground()
     addText('CODEX WATCH', 60, 50, 360, 38, 27, COLORS.white)
     addText('AWAY NOTIFICATIONS', 60, 102, 360, 25, 15, COLORS.muted)
-    this.status = addText('CONNECTING...', 60, 165, 360, 28, 16, COLORS.muted)
+    this.status = addText('CONNECTING TO PHONE...', 60, 165, 360, 28, 16, COLORS.muted)
     this.count = addText('—', 60, 215, 360, 72, 52, COLORS.greenText)
     this.detail = addText('PENDING APPROVALS', 60, 292, 360, 28, 15, COLORS.white)
     this.card = createWidget(widget.BUTTON, {
@@ -64,30 +93,17 @@ Page(BasePage({
     })
     this.load()
     this.refreshTimer = setInterval(() => this.load(), 30000)
-    this.startBackground()
-  },
-
-  startBackground() {
-    try {
-      const result = requestPermission({
-        permissions: ['device:os.bg_service'],
-        callback: permissions => {
-          console.log(TAG + ' Background permission callback: ' + JSON.stringify(permissions))
-          if (Array.isArray(permissions) && permissions[0] === 2) {
-            launchBackgroundService()
-          }
-        }
-      })
-      console.log(TAG + ' Background permission result: ' + result)
-      if (result === 2) launchBackgroundService()
-      else if (result === 1) console.log(TAG + ' Background permission cannot be requested')
-    } catch (error) {
-      console.log(TAG + ' Background permission failed: ' + String(error))
-    }
+    startBackgroundService()
   },
 
   async load() {
     if (this.destroyed || this.loading) return
+    if (!isBleConnected(connectStatus)) {
+      this.status.text = 'PHONE DISCONNECTED'
+      this.status.color = COLORS.redText
+      this.detail.text = 'WAITING FOR PHONE CONNECTION'
+      return
+    }
     this.loading = true
     try {
       const result = await this.request({
@@ -103,7 +119,7 @@ Page(BasePage({
         : 'NO PENDING APPROVALS'
       this.status.color = COLORS.greenText
     } catch (error) {
-      this.status.text = 'BRIDGE OFFLINE'
+      this.status.text = phoneConnectionLabel(error, isBleConnected(connectStatus))
       this.status.color = COLORS.redText
       this.detail.text = String(error && error.message || error).slice(0, 40)
     } finally {
@@ -117,7 +133,7 @@ Page(BasePage({
 
   onResume() {
     this.load()
-    this.startBackground()
+    startBackgroundService()
     if (!this.refreshTimer) this.refreshTimer = setInterval(() => this.load(), 30000)
     activateKeypad(action => {
       if (action === 'select') this.openApprovals()
